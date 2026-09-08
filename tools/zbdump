@@ -12,6 +12,7 @@ import sys
 import signal
 import argparse
 import os
+from serial import SerialException
 from scapy.all import Dot15d4FCS # type: ignore
 from killerbee import KillerBee, PcapDumper, DainTreeDumper, DLT_IEEE802_15_4
 from killerbee.scapy_extensions import kbgetpanid
@@ -58,7 +59,15 @@ def dump_packets(args):
 
     while args.count != packetcount:
 
-        packet: Optional[Dict[Union[int, str], Any]] = kb.pnext()
+        try:
+            packet: Optional[Dict[Union[int, str], Any]] = kb.pnext()
+        except SerialException:
+            # The device closed (e.g. Ctrl-C - interrupt() above closes kb
+            # from the signal handler, which can race a pnext() call
+            # blocked reading) or was physically disconnected mid-capture.
+            # Either way, stop cleanly - the pcap/dsna files are already
+            # finalized by the time this is raised.
+            break
 
         if packet is None:
             continue
@@ -74,6 +83,7 @@ def dump_packets(args):
                     sys.exit(0)
                 else:
                     unbuffered.write('.')
+                    unbuffered.flush()
 
             if pcap_dumper is not None:
                 pcap_dumper.pcap_dump(packet['bytes'], ant_dbm=packet['dbm'], freq_mhz=rf_freq_mhz)
@@ -112,7 +122,7 @@ def main():
 
     #Handle required args
     if args.verbose:
-        unbuffered = os.fdopen(sys.stdout.fileno(), 'w', 0)
+        unbuffered = sys.stdout
 
     if args.channel == None:
         print("ERROR: Must specify a channel.", file=sys.stderr)

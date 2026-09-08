@@ -126,16 +126,21 @@ class CC1352P7:
         self.handle.write(frame)
 
     def __read_exact(self, n: int, timeout: Optional[float] = None) -> Optional[bytes]:
-        if self.handle is None:
+        # Snapshot self.handle once: close() (e.g. from a SIGINT handler
+        # while this method is blocked in a read - see tools/zbdump) can set
+        # self.handle to None between the initial check and the finally
+        # block below if we keep re-reading the attribute.
+        handle = self.handle
+        if handle is None:
             raise Exception("Handle does not exist")
         if timeout is not None:
-            old = self.handle.timeout
-            self.handle.timeout = timeout
+            old = handle.timeout
+            handle.timeout = timeout
         try:
-            data = self.handle.read(n)
+            data = handle.read(n)
         finally:
             if timeout is not None:
-                self.handle.timeout = old
+                handle.timeout = old
         if len(data) != n:
             return None
         return data
