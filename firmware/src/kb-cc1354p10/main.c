@@ -32,6 +32,16 @@
  * internally, hitting the same unreliable-blocking-wait class of issue
  * rfPostAndPoll() exists to work around, just via a TI driver call this
  * firmware doesn't control the internals of. See README.md.
+ *
+ * stage 4: + sub-1GHz (915 MHz US ISM, KillerBee page 31, channels 1-10)
+ * alongside the native 2.4 GHz PHY, via a second radio setup (SUN O-QPSK
+ * Rate Mode 0, CMD_PROP_RX/CMD_PROP_TX) that SET_CHANNEL's new page byte
+ * switches to at runtime with RF_close()+RF_open() - the exact operation
+ * called out above as an unreliable blocking wait on this hardware. This
+ * was a deliberate, explicit tradeoff (see git history): a second,
+ * separate sub-1GHz-only firmware image would have avoided the risk
+ * entirely, at the cost of needing a reflash to switch bands. Not yet
+ * hardware-validated.
  */
 
 #include <stdint.h>
@@ -50,6 +60,7 @@
 #include DeviceFamily_constructPath(driverlib/rf_common_cmd.h)
 #include DeviceFamily_constructPath(driverlib/rf_ieee_cmd.h)
 #include DeviceFamily_constructPath(driverlib/rf_ieee_mailbox.h)
+#include DeviceFamily_constructPath(driverlib/rf_prop_cmd.h)
 #include DeviceFamily_constructPath(driverlib/sys_ctrl.h)
 
 #include "ti_drivers_config.h"
@@ -62,6 +73,14 @@
 #define RF_cmdIeeeRx RF_cmdIeeeRx_ieee154
 #define RF_cmdIeeeTx RF_cmdIeeeTx_ieee154
 #define RF_cmdFs     RF_cmdFs_ieee154
+
+/* Sub-1GHz (915 MHz SUN O-QPSK) globals - see kb_cc1354p10.syscfg's
+ * RF_Settings_SUBG_OQPSK comment for why this PHY was chosen. */
+#define RF_propSubg           RF_prop_qpsk6kbpsrm0_1
+#define RF_cmdPropRadioSetup  RF_cmdPropRadioDivSetup_qpsk6kbpsrm0_1
+#define RF_cmdFsSubg          RF_cmdFs_qpsk6kbpsrm0_1
+#define RF_cmdPropTx          RF_cmdPropTx_qpsk6kbpsrm0_1
+#define RF_cmdPropRx          RF_cmdPropRx_qpsk6kbpsrm0_1
 
 #define KB_SOF              0xA5
 
@@ -146,6 +165,14 @@ static RF_Object rfObject;
 static RF_Handle rfHandle;
 static RF_CmdHandle sniffCmdHandle = RF_ALLOC_ERROR;
 
+/* BAND_24GHZ = native IEEE 802.15.4 (KillerBee page 0, channels 11-26).
+ * BAND_SUBG = 915 MHz SUN O-QPSK (KillerBee page 31, channels 1-10). See
+ * rfSwitchBand() for the RF_close()/RF_open() transition between them. */
+#define BAND_24GHZ  0
+#define BAND_SUBG   1
+static uint8_t currentBand = BAND_24GHZ;
+static uint8_t currentPage = 0;
+
 static uint8_t channel = 11;
 static bool snifferOn = false;
 static bool jammerOn = false;
@@ -191,9 +218,21 @@ static void rxCallback(RF_Handle h, RF_CmdHandle ch, RF_EventMask e)
             memcpy(slot->frame, p, frameLen);
             slot->frameLen = frameLen;
             slot->rssi = (int8_t)p[frameLen];
-            uint8_t corrCrc = p[frameLen + 1];
-            slot->crcOk = (corrCrc & 0x80) == 0; /* bit7 = bCrcErr */
-            memcpy(&slot->timestamp, &p[frameLen + 2], 4);
+            if (currentBand == BAND_SUBG) {
+                /* rxConf order for CMD_PROP_RX: RSSI(1), Timestamp(4),
+                 * Status(1) - see rf_prop_cmd.h's rfc_CMD_PROP_RX_s.rxConf
+                 * field order and rfc_propRxStatus_s (result bits 6:7,
+                 * 0 = received correctly). */
+                memcpy(&slot->timestamp, &p[frameLen + 1], 4);
+                uint8_t status = p[frameLen + 5];
+                slot->crcOk = ((status >> 6) & 0x3) == 0;
+            } else {
+                /* rxConfig order for CMD_IEEE_RX: RSSI(1), CorrCrc(1),
+                 * Timestamp(4) - bit7 of CorrCrc is bCrcErr. */
+                uint8_t corrCrc = p[frameLen + 1];
+                slot->crcOk = (corrCrc & 0x80) == 0;
+                memcpy(&slot->timestamp, &p[frameLen + 2], 4);
+            }
             capHead = next;
             sem_post(&capSem);
         }
@@ -226,8 +265,34 @@ static void *rfForwardThread(void *arg0)
     }
 }
 
+/* Forward declaration - rfSniffStartSubg() needs rfTuneToChannel() (below)
+ * since, unlike CMD_IEEE_RX, CMD_PROP_RX has no channel field of its own. */
+static bool rfTuneToChannel(uint8_t ch);
+
+static bool rfSniffStartSubg(uint8_t ch)
+{
+    if (!rfTuneToChannel(ch)) {
+        return false;
+    }
+
+    RF_cmdPropRx.pQueue = &rxDataQueue;
+    RF_cmdPropRx.pOutput = NULL;
+    RF_cmdPropRx.rxConf.bAppendRssi = 1;
+    RF_cmdPropRx.rxConf.bAppendTimestamp = 1;
+    RF_cmdPropRx.rxConf.bAppendStatus = 1;
+
+    sniffCmdHandle = RF_postCmd(rfHandle, (RF_Op *)&RF_cmdPropRx,
+                                 RF_PriorityNormal, rxCallback,
+                                 RF_EventRxEntryDone);
+    return sniffCmdHandle != RF_ALLOC_ERROR;
+}
+
 static bool rfSniffStart(uint8_t ch)
 {
+    if (currentBand == BAND_SUBG) {
+        return rfSniffStartSubg(ch);
+    }
+
     RF_cmdIeeeRx.channel = ch;
     RF_cmdIeeeRx.pRxQ = &rxDataQueue;
     RF_cmdIeeeRx.pOutput = &rxStatistics;
@@ -285,22 +350,41 @@ static bool rfPostAndPoll(RF_Op *op, uint16_t okStatus)
     return false;
 }
 
-/* Neither CMD_IEEE_TX nor CMD_TX_TEST carries its own channel field - both
- * transmit on whatever frequency the synth is currently tuned to, so an
- * explicit CMD_FS is required before either, regardless of prior state. */
+/* Neither CMD_IEEE_TX/CMD_PROP_TX nor CMD_TX_TEST carries its own channel
+ * field - all transmit (and, for BAND_SUBG, CMD_PROP_RX also receives) on
+ * whatever frequency the synth is currently tuned to, so an explicit
+ * CMD_FS is required before any of them, regardless of prior state.
+ *
+ * Channel-to-frequency mapping for BAND_SUBG follows the classic IEEE
+ * 802.15.4-2006 915 MHz US ISM band plan (channels 1-10, 906 + 2*(ch-1)
+ * MHz - 906..924 MHz) rather than KillerBee's own kbutils.py page-31
+ * frequency() helper, which uses a denser/different spacing more suited
+ * to a generic SUN-PHY channel plan - channels 1-10 specifically was the
+ * explicit ask this was built for, and matches the real, well-known
+ * standard channel numbering. */
 static bool rfTuneToChannel(uint8_t ch)
 {
+    if (currentBand == BAND_SUBG) {
+        RF_cmdFsSubg.frequency = (uint16_t)(906 + 2 * (ch - 1));
+        RF_cmdFsSubg.fractFreq = 0;
+        return rfPostAndPoll((RF_Op *)&RF_cmdFsSubg, DONE_OK);
+    }
+
     RF_cmdFs.frequency = (uint16_t)(2405 + 5 * (ch - 11));
     RF_cmdFs.fractFreq = 0;
-
     return rfPostAndPoll((RF_Op *)&RF_cmdFs, DONE_OK);
 }
 
 static bool rfTransmitOnce(const uint8_t *frame, uint8_t len)
 {
+    if (currentBand == BAND_SUBG) {
+        RF_cmdPropTx.pktLen = len;
+        RF_cmdPropTx.pPkt = (uint8_t *)frame;
+        return rfPostAndPoll((RF_Op *)&RF_cmdPropTx, DONE_OK);
+    }
+
     RF_cmdIeeeTx.payloadLen = len;
     RF_cmdIeeeTx.pPayload = (uint8_t *)frame;
-
     return rfPostAndPoll((RF_Op *)&RF_cmdIeeeTx, IEEE_DONE_OK);
 }
 
@@ -437,6 +521,15 @@ static bool startJammer(uint8_t mode, uint8_t ch)
 {
     jamMode = mode;
     if (mode == JAM_MODE_REFLEXIVE) {
+        /* reflexJamThread() posts CMD_IEEE_RX unconditionally - it isn't
+         * band-aware like rfSniffStart()/rfTuneToChannel()/rfTransmitOnce()
+         * are, so it would post a mismatched command if the RF core is
+         * actually set up for the sub-1GHz PHY. Not yet implemented for
+         * BAND_SUBG - constant-carrier jamming (CMD_TX_TEST, PHY-agnostic)
+         * still works there via the rfJamStart() path below. */
+        if (currentBand == BAND_SUBG) {
+            return false;
+        }
         reflexRunning = true;
         pthread_attr_t attrs;
         pthread_attr_init(&attrs);
@@ -451,6 +544,46 @@ static bool startJammer(uint8_t mode, uint8_t ch)
     return rfJamStart(ch);
 }
 
+/* ==================== Band switching (2.4 GHz <-> sub-1GHz) ==================== */
+
+/* Switches the RF core between the native 2.4 GHz IEEE 802.15.4 setup and
+ * the 915 MHz SUN O-QPSK setup via RF_close()+RF_open() - see this file's
+ * header comment (stage 4) for why this specific operation was an
+ * explicit, accepted risk rather than the safer separate-firmware
+ * alternative. Caller must have already stopped any sniffer/jammer
+ * (handleCommand's KB_CMD_SET_CHANNEL does this before calling in). */
+static bool rfSwitchBand(uint8_t targetBand)
+{
+    if (targetBand == currentBand) {
+        return true;
+    }
+
+    RF_close(rfHandle);
+
+    RF_Params rfParams;
+    RF_Params_init(&rfParams);
+    if (targetBand == BAND_SUBG) {
+        rfHandle = RF_open(&rfObject, &RF_propSubg,
+                            (RF_RadioSetup *)&RF_cmdPropRadioSetup, &rfParams);
+    } else {
+        rfHandle = RF_open(&rfObject, &RF_prop_ieee154,
+                            (RF_RadioSetup *)&RF_cmdRadioSetup_ieee154, &rfParams);
+    }
+
+    if (rfHandle == NULL) {
+        /* Same fault convention as mainThread's own RF_open() failure
+         * path - no working RF handle to serve any further RF command
+         * with, so don't risk passing a NULL handle into RF_postCmd(). */
+        while (1) {
+            GPIO_toggle(CONFIG_GPIO_RLED);
+            usleep(500000);
+        }
+    }
+
+    currentBand = targetBand;
+    return true;
+}
+
 /* ==================== Command dispatch ==================== */
 
 static void handleCommand(uint8_t cmd, const uint8_t *payload, uint8_t len)
@@ -460,30 +593,53 @@ static void handleCommand(uint8_t cmd, const uint8_t *payload, uint8_t len)
         sendReply(cmd, (const uint8_t *)FW_ID, (uint8_t)(sizeof(FW_ID) - 1));
         break;
 
-    case KB_CMD_GET_CHANNEL:
-        sendReply(cmd, &channel, 1);
+    case KB_CMD_GET_CHANNEL: {
+        uint8_t reply[2] = { channel, currentPage };
+        sendReply(cmd, reply, sizeof(reply));
         break;
+    }
 
-    case KB_CMD_SET_CHANNEL:
-        if (len == 1 && payload[0] >= 11 && payload[0] <= 26) {
-            channel = payload[0];
-            bool ok = true;
-            if (snifferOn) {
-                rfSniffStop();
-                snifferOn = rfSniffStart(channel);
-                ok = snifferOn;
-            } else if (jammerOn && jamMode == JAM_MODE_CONSTANT) {
-                rfJamStop();
-                jammerOn = rfJamStart(channel);
-                ok = jammerOn;
-            }
-            /* Reflexive jam reads `channel` fresh every loop iteration, so
-             * no explicit restart is needed for that mode. */
-            sendStatus(cmd, ok ? STATUS_OK : STATUS_ERROR);
-        } else {
+    case KB_CMD_SET_CHANNEL: {
+        /* payload = [channel] (legacy, always page 0/2.4GHz) or
+         * [channel][page] (page 0 = 2.4GHz 11-26, page 31 = 915MHz SUN
+         * O-QPSK 1-10, matching KillerBee's own FREQ_915 page number). */
+        if (len < 1 || len > 2) {
             sendStatus(cmd, STATUS_ERROR);
+            break;
         }
+        uint8_t newChannel = payload[0];
+        uint8_t newPage = (len == 2) ? payload[1] : 0;
+        bool validRange = (newPage == 0 && newChannel >= 11 && newChannel <= 26)
+                        || (newPage == 31 && newChannel >= 1 && newChannel <= 10);
+        if (!validRange) {
+            sendStatus(cmd, STATUS_ERROR);
+            break;
+        }
+
+        bool wasSniffing = snifferOn;
+        bool wasJamming = jammerOn;
+        uint8_t prevJamMode = jamMode;
+        if (wasSniffing) {
+            rfSniffStop();
+        }
+        if (wasJamming) {
+            stopJammer();
+        }
+
+        bool ok = rfSwitchBand(newPage == 31 ? BAND_SUBG : BAND_24GHZ);
+        channel = newChannel;
+        currentPage = newPage;
+
+        if (ok && wasSniffing) {
+            snifferOn = rfSniffStart(channel);
+            ok = snifferOn;
+        } else if (ok && wasJamming) {
+            jammerOn = startJammer(prevJamMode, channel);
+            ok = jammerOn;
+        }
+        sendStatus(cmd, ok ? STATUS_OK : STATUS_ERROR);
         break;
+    }
 
     case KB_CMD_SNIFFER_ON:
         if (jammerOn) {

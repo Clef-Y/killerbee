@@ -60,6 +60,27 @@ const phyInst = commonRf.addIeeePhy(customStack, default154Phy);
 phyInst.$name = "RF_Settings_IEEE_802_15_4";
 phyInst.codeExportConfig.useMulti = false;
 
+/* ======== Radio Configuration: 915 MHz SUN O-QPSK (sub-1GHz) PHY ========
+ * Modern IEEE 802.15.4g "SUN" O-QPSK equivalent of the classic 915 MHz
+ * Zigbee band (KillerBee page 31 / FREQ_915), Rate Mode 0 (6.25 kbps,
+ * 100 kchip/s) - the mandatory/base rate mode per 802.15.4g, chosen for
+ * broadest interoperability. TI's own preset label marks this "Release
+ * Candidate" (see cc1354p10_prop_pg20/param_syscfg.json), i.e. not a
+ * TI-validated production PHY - treat accordingly.
+ *
+ * Runtime-switched with the 2.4 GHz PHY above via RF_close()+RF_open() in
+ * main.c (see its rfSwitchBand() comment for the tradeoffs of that
+ * approach on this hardware). */
+const subgPhy = {
+    args: {
+        freqBand: "868",
+        phyType868: "qpsk6kbpsrm0"
+    }
+};
+const subgPhyInst = commonRf.addPropPhy(customStack, subgPhy, false);
+subgPhyInst.$name = "RF_Settings_SUBG_OQPSK";
+subgPhyInst.codeExportConfig.useMulti = false;
+
 /* ======== RF Design ======== */
 var rfDesign = scripting.addModule("ti/devices/radioconfig/rfdesign");
 const rfDesignSettings = system.getScript("/ti/common/lprf_rf_design_settings.js").rfDesignSettings;

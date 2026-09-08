@@ -28,19 +28,24 @@ It drives the RF core directly with raw `CMD_IEEE_RX` / `CMD_IEEE_TX` /
 promiscuous capture, arbitrary frame injection, and PHY-level jamming — the
 things a MAC-filtered "coprocessor" firmware would take away.
 
+As of stage 4, it also supports the 915 MHz US ISM band (channels 1-10)
+via a second, runtime-switchable radio setup - see "Sub-1GHz support"
+below.
+
 ## Capabilities mapped to KillerBee
 
 | KBCapabilities   | Supported | Notes |
 |------------------|-----------|-------|
-| SNIFF            | yes       | Promiscuous `CMD_IEEE_RX`, frame filtering off by default |
-| SETCHAN          | yes       | Channels 11-26 (2.4 GHz) only — no Sub-1GHz support in this firmware |
-| INJECT           | yes       | `CMD_IEEE_TX`, hardware auto-computes/appends the FCS |
-| SELFACK          | yes*      | Extra `driver.set_selfack()` method — see caveat below; no generic KillerBee-level setter exists in this codebase for any device |
-| PHYJAM           | yes       | Continuous `CMD_TX_TEST` (modulated PRBS-15 garbage) |
-| PHYJAM_REFLEX    | yes*      | Best-effort software-loop reflex — see caveat below |
+| SNIFF            | yes       | Promiscuous `CMD_IEEE_RX` (2.4GHz) / `CMD_PROP_RX` (915MHz), frame filtering off by default |
+| SETCHAN          | yes       | Channels 11-26 (2.4 GHz, page 0) and 1-10 (915 MHz, page 31) |
+| INJECT           | yes       | `CMD_IEEE_TX` (2.4GHz) / `CMD_PROP_TX` (915MHz), hardware auto-computes/appends the FCS |
+| SELFACK          | yes*      | Extra `driver.set_selfack()` method — see caveat below; no generic KillerBee-level setter exists in this codebase for any device. 2.4 GHz only - see Sub-1GHz support |
+| PHYJAM           | yes       | Continuous `CMD_TX_TEST` (modulated PRBS-15 garbage) - PHY-agnostic, works on either band |
+| PHYJAM_REFLEX    | yes*      | Best-effort software-loop reflex — see caveat below. 2.4 GHz only - see Sub-1GHz support |
 | SET_SYNC         | no        | The native IEEE 802.15.4 RX/TX commands use a fixed, standard O-QPSK preamble/SFD; there is no register here to reprogram it (unlike CC2420-style radios) |
 | FREQ_2400        | yes       | |
-| FREQ_900/863/868/870/915 | no | This firmware only configures the 2.4 GHz IEEE 802.15.4 PHY |
+| FREQ_915         | yes       | 915 MHz US ISM, channels 1-10 - see "Sub-1GHz support" below |
+| FREQ_900/863/868/870 | no    | Only 2.4 GHz and 915 MHz US ISM are configured in this firmware |
 | BOOT             | no        | No bootloader protocol exposed over this UART; reflash via the debug probe (see below) |
 
 \* **Self-ACK caveat:** enabling auto-ACK (`RF_cmdIeeeRx.frameFiltOpt.autoAckEn`)
@@ -57,6 +62,61 @@ hook for this over the public radio command API. Short frames may finish
 before the jam lands; it is most effective against longer frames or ARQ
 retransmissions.
 
+## Sub-1GHz support (915 MHz US ISM, channels 1-10)
+
+A second radio setup - **SUN O-QPSK, Rate Mode 0** (6.25 kbps, 100 kchip/s;
+the mandatory/base rate per IEEE 802.15.4g, for broadest interoperability)
+- alongside the native 2.4 GHz one, added in `kb_cc1354p10.syscfg` as
+`RF_Settings_SUBG_OQPSK`. TI's own preset label marks this PHY **"Release
+Candidate"** (see `cc1354p10_prop_pg20/param_syscfg.json` in the SDK) - not
+a TI-validated production PHY, so treat capture quality/sensitivity with
+appropriate caution; this has only been validated for whether the plumbing
+works (no hangs, no crashes across a full 10-channel/20s-each scan), not
+for genuine over-the-air decode accuracy against a real 915 MHz SUN O-QPSK
+transmitter.
+
+`SET_CHANNEL`'s payload grew a second, optional byte for this: `[channel]`
+(legacy, always page 0) or `[channel][page]`, where page 0 = 2.4 GHz
+(channel 11-26, unchanged) and page 31 = 915 MHz (channel 1-10) - page 31
+matches KillerBee's own `KBCapabilities.FREQ_915` page number.
+`GET_CHANNEL`'s reply grew to match: `[channel][page]`.
+
+**Channel-to-frequency mapping** for the 915 MHz band follows the classic
+IEEE 802.15.4-2006 US ISM band plan - channel *n* is `906 + 2*(n-1)` MHz
+(906, 908, ..., 924 MHz) - **not** KillerBee's own `kbutils.py`
+`frequency()` helper's page-31 formula, which uses a denser/different
+spacing more suited to a generic SUN-PHY channel plan. Channels 1-10 on
+the real, well-known standard channel numbering was the explicit target
+this was built for; `kb.frequency(channel, page=31)` (used by tools like
+`zbdump` to print a human-readable frequency banner) will report a
+different, **not accurate**, frequency for this device as a result - the
+mismatch is deliberate and documented, not an oversight, but worth knowing
+if a printed banner frequency looks off.
+
+**Switching bands is a real, deliberate risk, not a free operation.**
+Unlike the 2.4 GHz-only channel changes, switching *between* page 0 and
+page 31 tears down and rebuilds the entire RF driver connection
+(`RF_close()`+`RF_open()` with a different radio setup) because the two
+PHYs are fundamentally different RF core configurations. `RF_close()`
+pends on the RF command queue internally - the same unreliable-blocking-
+wait class of issue documented elsewhere in `main.c` (see `rfPostAndPoll()`
+and `KB_CMD_RESET`'s comments) for other TI driver calls on this hardware.
+This was an explicit, accepted tradeoff: a second, separate sub-1GHz-only
+firmware image would have avoided the risk entirely, at the cost of
+needing a reflash to switch bands. In testing (a full 10-channel scan plus
+repeated band switches) this did not hang, but if it ever does, the same
+recovery used throughout this project's bring-up works: a JTAG-level board
+reset through the debug probe (see the RF-core-stuck troubleshooting
+section above), no reflash needed.
+
+**Not yet supported on the sub-1GHz band:** reflexive jamming
+(`jammer_on(method="reflexive")` - its listen loop posts `CMD_IEEE_RX`
+unconditionally and isn't band-aware; `startJammer()` explicitly rejects
+it while on `BAND_SUBG` rather than silently misbehave) and self-ACK
+(`SET_SELFACK` only takes effect through `CMD_IEEE_RX`'s frame-filter
+options). Constant-carrier jamming (`CMD_TX_TEST`) and plain sniff/inject
+work on both bands.
+
 ## Wire protocol
 
 921600 baud, 8N1, no flow control, no CRC (short USB-serial link, matches the
@@ -71,8 +131,8 @@ Device -> Host:  [0xA5][CMD|0x80] [LEN][LEN bytes payload]   (reply to CMD)
 | CMD  | Name             | Payload (host->device)                        | Reply payload |
 |------|------------------|------------------------------------------------|---------------|
 | 0x01 | PING             | —                                                | ASCII firmware ID, e.g. `KB-CC1354P10 v1.0` |
-| 0x02 | GET_CHANNEL      | —                                                | `[channel]` |
-| 0x03 | SET_CHANNEL      | `[channel]` (11-26)                             | `[status]` |
+| 0x02 | GET_CHANNEL      | —                                                | `[channel][page]` |
+| 0x03 | SET_CHANNEL      | `[channel]` or `[channel][page]` (page 0: 11-26, page 31: 1-10) | `[status]` |
 | 0x04 | SNIFFER_ON       | —                                                | `[status]` |
 | 0x05 | SNIFFER_OFF      | —                                                | `[status]` |
 | 0x06 | INJECT           | `[count][delay_ms lo][delay_ms hi][frame...]`   | `[status]` |
@@ -136,6 +196,13 @@ kb.inject(b"\x01\x02\x03...")
 kb.driver.set_selfack(True)       # extra, non-standard KillerBee method
 kb.jammer_on(method="reflexive")  # or method=None / "constant"
 kb.jammer_off()
+
+# 915 MHz US ISM band (page 31, channels 1-10) - see "Sub-1GHz support"
+kb.set_channel(1, page=31)
+kb.sniffer_on()
+pkt = kb.pnext(timeout=2)
+kb.set_channel(15)  # page defaults back to 0 (2.4 GHz)
+
 kb.close()
 ```
 
