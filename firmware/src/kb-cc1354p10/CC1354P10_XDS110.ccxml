@@ -9,6 +9,11 @@
             <property Type="choicelist" Value="0" id="SWD Mode Settings">
                 <choice Name="JTAG (1149.1), SWD and cJTAG are disabled" value="nothing"/>
             </property>
+            <property Type="choicelist" Value="1" id="Debug Probe Selection">
+                <choice Name="Select by serial number" value="0">
+                    <property Type="stringfield" Value="LS4501DC" id="-- Enter the serial number"/>
+                </choice>
+            </property>
             <platform XML_version="1.2" id="platform_0">
                 <instance XML_version="1.2" desc="CC1354P10" href="devices/cc1354p10.xml" id="CC1354P10" xml="cc1354p10.xml" xmlpath="devices"/>
                 <device HW_revision="1" XML_version="1.2" desc="CC1354P10" description="SimpleLink(TM) Multiprotocol SUB-1 GHz(R) low energy cc1354P10 wireless MCU" id="CC1354P10" partnum="CC1354P10" simulation="no"/>

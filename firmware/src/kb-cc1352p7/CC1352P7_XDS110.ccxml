@@ -11,6 +11,11 @@
                     <property Type="choicelist" Value="1" id="XDS110 Aux Port"/>
                 </choice>
             </property>
+            <property Type="choicelist" Value="1" id="Debug Probe Selection">
+                <choice Name="Select by serial number" value="0">
+                    <property Type="stringfield" Value="L45003IW" id="-- Enter the serial number"/>
+                </choice>
+            </property>
             <platform XML_version="1.2" id="platform_0">
                 <instance XML_version="1.2" desc="CC1352P7" href="devices/cc1352p7.xml" id="CC1352P7" xml="cc1352p7.xml" xmlpath="devices"/>
                 <device HW_revision="1" XML_version="1.2" desc="CC1352P7" description="SimpleLink(TM) multi-protocol CC1352P7 wireless MCU" id="CC1352P7" partnum="CC1352P7" simulation="no"/>
