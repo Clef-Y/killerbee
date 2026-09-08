@@ -12,8 +12,11 @@
  *   stage 3: + INJECT (CMD_IEEE_TX), JAMMER_ON/OFF (constant CMD_TX_TEST
  *   and a reflexive listen/burst software loop), and SET_SELFACK.
  *   Hardware-validated (INJECT single/multi-frame + invalid-payload
- *   rejection, JAMMER constant and reflexive start/stop). SET_SELFACK not
- *   yet re-validated against real hardware.
+ *   rejection; JAMMER constant and reflexive start/stop, stays responsive
+ *   while active; SET_SELFACK enable/disable both idle and while
+ *   sniffing). The actual over-the-air auto-ACK behavior of SET_SELFACK
+ *   has not been observed - that needs a second radio sending frames
+ *   addressed to this device, not just command-level round-tripping.
  *
  * All RF commands are posted with RF_postCmd() and waited on by polling
  * the command's own .status field (rfPostAndPoll()) rather than a blocking
