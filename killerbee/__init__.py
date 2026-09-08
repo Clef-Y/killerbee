@@ -16,6 +16,7 @@ from .kbutils import issl_nodetest
 from .kbutils import issl_beehive
 from .kbutils import iszigduino
 from .kbutils import isfreakduino
+from .kbutils import iscc1354p10
 from .kbutils import *
 from .zigbeedecode import * #would like to import only within killerbee class
 from .dot154decode import * #would like to import only within killerbee class
@@ -87,6 +88,9 @@ class KillerBee:
             elif hardware == "sl_beehive":
                 from .dev_sl_beehive import SL_BEEHIVE
                 self.driver = SL_BEEHIVE(device)
+            elif hardware == "cc1354p10":
+                from .dev_cc1354p10 import CC1354P10
+                self.driver = CC1354P10(device)
             elif hardware == "zigduino":
                 from .dev_zigduino import ZIGDUINO
                 self.driver = ZIGDUINO(device)
@@ -164,6 +168,9 @@ class KillerBee:
                     elif (DEV_ENABLE_SL_BEEHIVE and issl_beehive(self.dev)):
                         from .dev_sl_beehive import SL_BEEHIVE
                         self.driver = SL_BEEHIVE(self.dev)
+                    elif (DEV_ENABLE_CC1354P10 and iscc1354p10(self.dev)):
+                        from .dev_cc1354p10 import CC1354P10
+                        self.driver = CC1354P10(self.dev)
                     elif (DEV_ENABLE_ZIGDUINO and iszigduino(self.dev)):
                         from .dev_zigduino import ZIGDUINO
                         self.driver = ZIGDUINO(self.dev)

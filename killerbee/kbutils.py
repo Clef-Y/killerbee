@@ -277,6 +277,8 @@ def devlist(vendor: Optional[Any]=None, product: Optional[Any]=None, gps: Option
             devlist.append([serialdev, "Silabs NodeTest", ""])
         elif (DEV_ENABLE_SL_BEEHIVE and issl_beehive(serialdev)):
             devlist.append([serialdev, "BeeHive SG", ""])
+        elif (DEV_ENABLE_CC1354P10 and iscc1354p10(serialdev)):
+            devlist.append([serialdev, "TI CC1354P10", ""])
         elif (DEV_ENABLE_ZIGDUINO and iszigduino(serialdev)):
             devlist.append([serialdev, "Zigduino", ""])
         elif (DEV_ENABLE_FREAKDUINO and isfreakduino(serialdev)):
@@ -462,6 +464,37 @@ def issl_beehive(serialdev: str) -> bool:
             break
     s.close()
     return (version is not None)
+
+def iscc1354p10(serialdev: str) -> bool:
+    '''
+    Determine if a given serial device is a TI CC1354P10 running the
+    KillerBee firmware in firmware/src/kb-cc1354p10 (reached over the
+    standalone LP-XDS110 debug probe's auxiliary backchannel UART).
+    @type serialdev: String
+    @param serialdev: Path to a serial device, ex /dev/ttyACM0.
+    @rtype: Boolean
+    '''
+    try:
+        s: serial.Serial = serial.Serial(port=serialdev, baudrate=921600, timeout=.3,
+                                          bytesize=8, parity='N', stopbits=1, xonxoff=0)
+    except serial.serialutil.SerialException:
+        return False
+
+    try:
+        s.reset_input_buffer()
+        s.write(bytes([0xA5, 0x01, 0x00]))  # KB_SOF, CMD_PING, LEN=0
+        sof = s.read(1)
+        if sof != b'\xA5':
+            return False
+        hdr = s.read(2)
+        if len(hdr) != 2 or hdr[0] != 0x81:  # CMD_PING | CMD_REPLY_BIT
+            return False
+        payload = s.read(hdr[1])
+        return payload.startswith(b"KB-CC1354P10")
+    except serial.serialutil.SerialException:
+        return False
+    finally:
+        s.close()
 
 def isfreakduino(serialdev: str) -> bool:
     '''

@@ -23,3 +23,4 @@ DEV_ENABLE_TELOSB: bool       = False
 DEV_ENABLE_APIMOTE2: bool     = True
 DEV_ENABLE_APIMOTE1: bool     = False
 DEV_ENABLE_BUMBLEBEE: bool    = False
+DEV_ENABLE_CC1354P10: bool    = True

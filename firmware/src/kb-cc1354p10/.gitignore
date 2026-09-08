@@ -1,0 +1,17 @@
+# SysConfig-generated files - regenerated automatically by `make` from
+# kb_cc1354p10.syscfg, nothing here to hand-edit or track (see README.md).
+tirtos7/syscfg/
+tirtos7/ticlang/ti_devices_config.*
+tirtos7/ticlang/ti_drivers_config.*
+tirtos7/ticlang/ti_radio_config.*
+tirtos7/ticlang/ti_sysbios_config.*
+tirtos7/ticlang/ti_utils_build_compiler.opt
+tirtos7/ticlang/ti_utils_build_linker.cmd.genlibs
+tirtos7/ticlang/ti_utils_build_linker.cmd.genmap
+tirtos7/ticlang/syscfg_c.rov.xs
+
+# Build outputs
+tirtos7/ticlang/*.obj
+tirtos7/ticlang/*.out
+tirtos7/ticlang/*.hex
+tirtos7/ticlang/*.map

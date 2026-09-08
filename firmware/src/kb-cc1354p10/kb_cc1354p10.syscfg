@@ -1,0 +1,78 @@
+/*
+ * kb_cc1354p10.syscfg
+ *
+ * SysConfig script for the KillerBee CC1354P10 sniffer/injector/jammer
+ * firmware. Configures:
+ *   - RF driver on the native 2.4 GHz IEEE 802.15.4 PHY (channels 11-26)
+ *   - UART2 on the standalone LP-XDS110 probe's backchannel (the same
+ *     /dev/ttyACM* serial port already used to talk to the debug probe)
+ *
+ * Deliberately does NOT pull in the ti154stack MAC module - this firmware
+ * drives the RF core directly with raw CMD_IEEE_RX / CMD_IEEE_TX / CMD_TX_TEST
+ * radio commands so KillerBee gets full promiscuous / injection / jamming
+ * control instead of a MAC-filtered view of the air.
+ */
+// @cliArgs --board /ti/boards/LP_EM_CC1354P10_1 --rtos tirtos7
+
+/* ======== RF ======== */
+var RF = scripting.addModule("/ti/drivers/RF");
+if (system.deviceData.board && system.deviceData.board.components.RF) {
+    RF.$hardware = system.deviceData.board.components.RF;
+}
+
+/* ======== UART2 (XDS110 backchannel) ======== */
+var UART2 = scripting.addModule("/ti/drivers/UART2");
+var uart = UART2.addInstance();
+if (system.deviceData.board && system.deviceData.board.components.XDS110UART) {
+    uart.$hardware = system.deviceData.board.components.XDS110UART;
+}
+uart.$name = "CONFIG_UART2_KB";
+
+/* ======== Status LEDs ======== */
+var GPIO = scripting.addModule("/ti/drivers/GPIO");
+var LED_R = GPIO.addInstance();
+if (system.deviceData.board && system.deviceData.board.components.LED_RED) {
+    LED_R.$hardware = system.deviceData.board.components.LED_RED;
+} else {
+    LED_R.mode = "Output";
+}
+LED_R.$name = "CONFIG_GPIO_RLED";
+
+var LED_G = GPIO.addInstance();
+if (system.deviceData.board && system.deviceData.board.components.LED_GREEN) {
+    LED_G.$hardware = system.deviceData.board.components.LED_GREEN;
+} else {
+    LED_G.mode = "Output";
+}
+LED_G.$name = "CONFIG_GPIO_GLED";
+
+/* ======== Radio Configuration: native 2.4 GHz IEEE 802.15.4 PHY ======== */
+const commonRf = system.getScript("/ti/prop_rf/prop_rf_common.js");
+const boardName = commonRf.getDeviceOrLaunchPadName(true);
+const phyFilePath = "/ti/prop_rf/rf_config/" + boardName + "_rf_defaults.js";
+
+// Pull the board's default IEEE 802.15.4 (2.4 GHz) phy definition
+const default154Phy = system.getScript(phyFilePath).default154PhyList[0];
+
+// Add an instance of the "Custom" RF Stack and attach the ieee154 phy to it
+const customStack = scripting.addModule("/ti/devices/radioconfig/custom");
+const phyInst = commonRf.addIeeePhy(customStack, default154Phy);
+phyInst.$name = "RF_Settings_IEEE_802_15_4";
+phyInst.codeExportConfig.useMulti = false;
+
+/* ======== RF Design ======== */
+var rfDesign = scripting.addModule("ti/devices/radioconfig/rfdesign");
+const rfDesignSettings = system.getScript("/ti/common/lprf_rf_design_settings.js").rfDesignSettings;
+for (var setting in rfDesignSettings) {
+    rfDesign[setting] = rfDesignSettings[setting];
+}
+
+/* ======== Device / CCFG ======== */
+var device = scripting.addModule("ti/devices/CCFG");
+const ccfgSettings = system.getScript("/ti/common/lprf_ccfg_settings.js").ccfgSettings;
+for (var setting in ccfgSettings) {
+    device[setting] = ccfgSettings[setting];
+}
+
+/* ======== TI-RTOS7 kernel defaults ======== */
+const tirtos7_release_syscfg_js = system.getScript("tirtos7_release.syscfg.js");
