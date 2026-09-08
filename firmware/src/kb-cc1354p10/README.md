@@ -133,3 +133,22 @@ kb.close()
 Auto-detection also works (no `hardware=` needed) as long as
 `DEV_ENABLE_CC1354P10` is `True` in `killerbee/config.py` (it is, by default) —
 `KillerBee()` will probe serial devices with `kbutils.iscc1354p10()`.
+
+## Troubleshooting: SNIFFER_ON (or other RF commands) start returning ERROR
+
+Observed after heavy use (many jammer start/stop and channel-change cycles):
+the RF core can end up in a state where `KB_CMD_RESET` (the firmware's own
+software reset, which only clears local channel/sniffer/jammer state) no
+longer clears it, and commands that were working start returning
+`STATUS_ERROR` immediately, with `PING` and the UART link itself still fine.
+A full JTAG-level board reset through the debug probe clears it - no
+reflash needed:
+
+```sh
+/opt/ti/uniflash_sl/deskdb/content/TICloudAgent/linux/ccs_base/DebugServer/bin/DSLite memory \
+    -c firmware/src/kb-cc1354p10/CC1354P10_XDS110.ccxml -r 0x0,4 -o /tmp/discard.bin -e
+```
+
+(Any DSLite operation that connects and does its usual GEL-script board
+reset works - this one is just a minimal, side-effect-free memory read
+chosen for that reason.)
