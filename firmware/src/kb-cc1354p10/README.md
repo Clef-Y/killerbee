@@ -86,6 +86,15 @@ Device -> Host:  [0xA5][CMD|0x80] [LEN][LEN bytes payload]   (reply to CMD)
 2-byte FCS as received/to-transmit is FCS-less (hardware computes it on TX,
 and includes the real received FCS bytes on RX since `rxConfig.bIncludeCrc=1`).
 
+**RESET triggers a full chip reboot** (`SysCtrlSystemReset()`), not just a
+logical state reset - see the troubleshooting section below for why. The
+`[status]` reply is sent immediately before the reboot, so it does arrive,
+but the target chip (and therefore its UART) briefly goes away while it
+reboots. The debug probe's own USB connection to the host is unaffected
+(it's a separate USB device from the target chip), so on Linux this has
+been observed to *not* require replugging/reconnecting - just a short
+pause before the target responds again.
+
 ## Building
 
 Requires the TI toolchain already set up at `/opt/ti` (see `/opt/ti/ti-env.sh`):
@@ -134,15 +143,30 @@ Auto-detection also works (no `hardware=` needed) as long as
 `DEV_ENABLE_CC1354P10` is `True` in `killerbee/config.py` (it is, by default) —
 `KillerBee()` will probe serial devices with `kbutils.iscc1354p10()`.
 
-## Troubleshooting: SNIFFER_ON (or other RF commands) start returning ERROR
+## RF core can get stuck after heavy use - why RESET is a full reboot
 
 Observed after heavy use (many jammer start/stop and channel-change cycles):
-the RF core can end up in a state where `KB_CMD_RESET` (the firmware's own
-software reset, which only clears local channel/sniffer/jammer state) no
-longer clears it, and commands that were working start returning
-`STATUS_ERROR` immediately, with `PING` and the UART link itself still fine.
-A full JTAG-level board reset through the debug probe clears it - no
-reflash needed:
+the RF core can end up in a state where RF commands like `SNIFFER_ON` start
+returning `STATUS_ERROR` immediately, with `PING` and the UART link itself
+still fine. Two things were tried and rejected before landing on the
+current fix:
+
+- A logical reset that only cancels known commands and clears local state
+  (channel/sniffer/jammer flags) - does **not** clear it.
+- `RF_close()` + `RF_open()` (the natural in-firmware equivalent of "power
+  cycle the RF core") - `RF_close()` pends on the RF command queue
+  internally, and that pend was observed to hang indefinitely on this
+  hardware/SDK combination. This is the same unreliable-blocking-wait
+  problem `rfPostAndPoll()` already works around for ordinary RF commands
+  (see its comment in `main.c`) - it just resurfaces here through a TI
+  driver call this firmware doesn't control the internals of.
+
+What was found to reliably work, both externally and now built into the
+firmware's own `RESET` command: a genuine full chip reset
+(`SysCtrlSystemReset()`), which never returns and bypasses the RF driver's
+shutdown path entirely. If you're on firmware old enough not to have this,
+an external JTAG-level board reset through the debug probe has the same
+effect and needs no reflash:
 
 ```sh
 /opt/ti/uniflash_sl/deskdb/content/TICloudAgent/linux/ccs_base/DebugServer/bin/DSLite memory \

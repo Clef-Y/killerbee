@@ -23,6 +23,15 @@
  * RF_pendCmd(..., RF_EventLastCmdDone): on this hardware/setup that
  * blocking wait was observed to hang indefinitely even after the command
  * had already completed successfully, wedging the whole UART command loop.
+ *
+ * KB_CMD_RESET triggers a genuine full chip reset (SysCtrlSystemReset())
+ * rather than just clearing local state: after heavy use the RF core has
+ * been observed to get stuck (SNIFFER_ON etc. start returning
+ * STATUS_ERROR immediately) in a way that RF_close()+RF_open() doesn't
+ * reliably clear either - RF_close() pends on the RF command queue
+ * internally, hitting the same unreliable-blocking-wait class of issue
+ * rfPostAndPoll() exists to work around, just via a TI driver call this
+ * firmware doesn't control the internals of. See README.md.
  */
 
 #include <stdint.h>
@@ -41,6 +50,7 @@
 #include DeviceFamily_constructPath(driverlib/rf_common_cmd.h)
 #include DeviceFamily_constructPath(driverlib/rf_ieee_cmd.h)
 #include DeviceFamily_constructPath(driverlib/rf_ieee_mailbox.h)
+#include DeviceFamily_constructPath(driverlib/sys_ctrl.h)
 
 #include "ti_drivers_config.h"
 #include "ti_radio_config.h"
@@ -560,12 +570,31 @@ static void handleCommand(uint8_t cmd, const uint8_t *payload, uint8_t len)
         break;
 
     case KB_CMD_RESET:
-        rfSniffStop();
-        stopJammer();
-        snifferOn = false;
-        selfAckEnabled = false;
-        channel = 11;
+        /* A software-level stop (cancelling known commands via
+         * rfSniffStop()/stopJammer()) isn't always enough: after heavy use
+         * (many jammer/channel-change cycles) the RF core has been observed
+         * to end up in a state where RF commands like SNIFFER_ON start
+         * returning STATUS_ERROR immediately even though this UART command
+         * loop and PING are fine. An external JTAG-level board reset was
+         * found to reliably clear it. RF_close()+RF_open() (the natural
+         * in-firmware equivalent) was tried first, but RF_close() pends on
+         * the RF command queue internally, and that pend was observed to
+         * hang indefinitely on this hardware/SDK combination - the same
+         * unreliable-blocking-wait class of issue rfPostAndPoll() (see its
+         * comment above) already had to work around for ordinary RF
+         * commands, just hit here via a TI driver call this firmware
+         * doesn't control the internals of. A genuine full chip reset
+         * (SysCtrlSystemReset(), never returns) sidesteps that class of
+         * issue entirely by not calling into the RF driver's shutdown path
+         * at all, and is the truest available equivalent of the external
+         * JTAG reset that was observed to work. This means the UART/USB
+         * link itself drops and re-enumerates, same as after a reflash -
+         * send the OK reply and give it a moment to actually drain out the
+         * wire first so the host sees it before the link goes away. */
         sendStatus(cmd, STATUS_OK);
+        usleep(50000);
+        SysCtrlSystemReset();
+        /* unreachable */
         break;
 
     case KB_CMD_SET_SELFACK:
