@@ -9,10 +9,17 @@
  *   RESET, no RF. Hardware-validated.
  *   stage 2: + SNIFFER_ON/OFF - promiscuous CMD_IEEE_RX chained into a
  *   queue, async 0x90 packet forwarding to the host. Hardware-validated.
- *   stage 3 (current): + INJECT (CMD_IEEE_TX), JAMMER_ON/OFF (constant
- *   CMD_TX_TEST and a reflexive listen/burst software loop), and
- *   SET_SELFACK. Builds clean; not yet re-validated against real
- *   hardware after stage 2 (UART link has been down since).
+ *   stage 3: + INJECT (CMD_IEEE_TX), JAMMER_ON/OFF (constant CMD_TX_TEST
+ *   and a reflexive listen/burst software loop), and SET_SELFACK.
+ *   Hardware-validated (INJECT single/multi-frame + invalid-payload
+ *   rejection, JAMMER constant and reflexive start/stop). SET_SELFACK not
+ *   yet re-validated against real hardware.
+ *
+ * All RF commands are posted with RF_postCmd() and waited on by polling
+ * the command's own .status field (rfPostAndPoll()) rather than a blocking
+ * RF_pendCmd(..., RF_EventLastCmdDone): on this hardware/setup that
+ * blocking wait was observed to hang indefinitely even after the command
+ * had already completed successfully, wedging the whole UART command loop.
  */
 
 #include <stdint.h>
@@ -30,6 +37,7 @@
 #include DeviceFamily_constructPath(driverlib/rf_mailbox.h)
 #include DeviceFamily_constructPath(driverlib/rf_common_cmd.h)
 #include DeviceFamily_constructPath(driverlib/rf_ieee_cmd.h)
+#include DeviceFamily_constructPath(driverlib/rf_ieee_mailbox.h)
 
 #include "ti_drivers_config.h"
 #include "ti_radio_config.h"
@@ -236,6 +244,34 @@ static void rfSniffStop(void)
 
 /* ==================== TX / inject ==================== */
 
+/* Bounded poll of a posted command's status field instead of an indefinite
+ * RF_pendCmd(..., RF_EventLastCmdDone) wait: on this hardware/setup that
+ * blocking wait was observed to hang forever after CMD_FS/CMD_IEEE_TX had
+ * already completed successfully (status showed DONE_OK/IEEE_DONE_OK per
+ * rf_mailbox.h/rf_ieee_mailbox.h), so polling the status field directly is
+ * both simpler and avoids ever wedging the UART command loop even if a
+ * future command genuinely never finishes. `okStatus` is the command
+ * family's own "done ok" code (generic DONE_OK for CMD_FS/CMD_TX_TEST,
+ * IEEE_DONE_OK for CMD_IEEE_TX/CMD_IEEE_RX). */
+static bool rfPostAndPoll(RF_Op *op, uint16_t okStatus)
+{
+    RF_CmdHandle h = RF_postCmd(rfHandle, op, RF_PriorityNormal, NULL, 0);
+    if (h == RF_ALLOC_ERROR) {
+        return false;
+    }
+
+    for (uint32_t waitedUs = 0; waitedUs < 200000; waitedUs += 1000) {
+        uint16_t st = op->status;
+        if (st >= 0x0400) {
+            return (st == okStatus);
+        }
+        usleep(1000);
+    }
+
+    RF_cancelCmd(rfHandle, h, 0);
+    return false;
+}
+
 /* Neither CMD_IEEE_TX nor CMD_TX_TEST carries its own channel field - both
  * transmit on whatever frequency the synth is currently tuned to, so an
  * explicit CMD_FS is required before either, regardless of prior state. */
@@ -244,12 +280,7 @@ static bool rfTuneToChannel(uint8_t ch)
     RF_cmdFs.frequency = (uint16_t)(2405 + 5 * (ch - 11));
     RF_cmdFs.fractFreq = 0;
 
-    RF_CmdHandle h = RF_postCmd(rfHandle, (RF_Op *)&RF_cmdFs, RF_PriorityNormal, NULL, 0);
-    if (h == RF_ALLOC_ERROR) {
-        return false;
-    }
-    RF_EventMask result = RF_pendCmd(rfHandle, h, RF_EventLastCmdDone);
-    return (result & RF_EventLastCmdDone) != 0;
+    return rfPostAndPoll((RF_Op *)&RF_cmdFs, DONE_OK);
 }
 
 static bool rfTransmitOnce(const uint8_t *frame, uint8_t len)
@@ -257,12 +288,7 @@ static bool rfTransmitOnce(const uint8_t *frame, uint8_t len)
     RF_cmdIeeeTx.payloadLen = len;
     RF_cmdIeeeTx.pPayload = (uint8_t *)frame;
 
-    RF_CmdHandle h = RF_postCmd(rfHandle, (RF_Op *)&RF_cmdIeeeTx, RF_PriorityNormal, NULL, 0);
-    if (h == RF_ALLOC_ERROR) {
-        return false;
-    }
-    RF_EventMask result = RF_pendCmd(rfHandle, h, RF_EventLastCmdDone);
-    return (result & RF_EventLastCmdDone) != 0;
+    return rfPostAndPoll((RF_Op *)&RF_cmdIeeeTx, IEEE_DONE_OK);
 }
 
 /* ==================== Jammer ==================== */
@@ -325,10 +351,7 @@ static void rfReflexBurst(void)
     rfCmdTxTest.endTime = REFLEX_BURST_TICKS;
     rfCmdTxTest.syncWord = 0x930B51DE;
 
-    RF_CmdHandle h = RF_postCmd(rfHandle, (RF_Op *)&rfCmdTxTest, RF_PriorityNormal, NULL, 0);
-    if (h != RF_ALLOC_ERROR) {
-        RF_pendCmd(rfHandle, h, RF_EventLastCmdDone);
-    }
+    rfPostAndPoll((RF_Op *)&rfCmdTxTest, DONE_OK);
 }
 
 static void *reflexJamThread(void *arg0)
@@ -347,6 +370,8 @@ static void *reflexJamThread(void *arg0)
         RF_cmdIeeeRx.endTrigger.triggerType = TRIG_REL_START;
         RF_cmdIeeeRx.endTime = REFLEX_LISTEN_TICKS;
 
+        uint8_t capHeadBefore = capHead;
+
         RF_CmdHandle h = RF_postCmd(rfHandle, (RF_Op *)&RF_cmdIeeeRx,
                                      RF_PriorityNormal, rxCallback,
                                      RF_EventRxEntryDone);
@@ -354,9 +379,20 @@ static void *reflexJamThread(void *arg0)
             break;
         }
 
-        RF_EventMask result = RF_pendCmd(rfHandle, h,
-                                          RF_EventRxEntryDone | RF_EventLastCmdDone);
-        if (result & RF_EventRxEntryDone) {
+        /* Poll for the listen window to end rather than a blocking
+         * RF_pendCmd() - see rfPostAndPoll()'s comment for why. The window
+         * is ~1ms (REFLEX_LISTEN_TICKS), so give it a generous margin. */
+        for (uint32_t waitedUs = 0; waitedUs < 5000; waitedUs += 200) {
+            if (RF_cmdIeeeRx.status >= 0x0400) {
+                break;
+            }
+            usleep(200);
+        }
+        if (RF_cmdIeeeRx.status < 0x0400) {
+            RF_cancelCmd(rfHandle, h, 0);
+        }
+
+        if (capHead != capHeadBefore) {
             /* Activity seen within the window - fire the reflex burst.
              * Best-effort: hundreds of us to a few ms of reaction latency,
              * short frames may finish before the jam lands. */
