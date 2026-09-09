@@ -303,28 +303,52 @@ firmware can fix.
     available here - every tool this project has requires an attach that's
     already shown itself capable of changing the outcome.
 
-  **Honest bottom line:** the sub-1GHz radio path on this chip has a real,
-  reproducible reliability limitation under sustained TX activity, and a
-  real, TI-acknowledged forum report of the same failure class exists for
-  this exact chip - so this isn't specific to this project's firmware. Root
-  cause is still not conclusively identified, though the evidence leans
-  toward the M33 core legitimately sleeping (not crashed, not spin-locked)
-  and waiting on an interrupt that the wedged sub-1GHz RF core stops
-  delivering - a bare JTAG attach's architectural wake side-effect is the
-  most consistent explanation found for why that alone (no reset needed)
-  recovers it. Two genuine improvements were made and kept (`RF_yield()`,
-  permanent standby/idle disallow) because they're correct per TI's own
-  reference code, but neither fixed the underlying issue. Two separate
-  leads (RF power domain collapsing; PC parked in a specific WFI location)
-  were built up with real evidence and then retracted after failing a
-  control-test cross-check against known-good hardware - left in this
-  document rather than quietly dropped, since the retraction is as
-  informative as the original claim would have been. Treat any sustained
-  sub-1GHz TX activity (constant jam, or several back-to-back inject
-  packets) as something that can still end the session and require the
-  JTAG UART-resync step above to recover. A real fix, if one exists, most
-  likely needs TI's direct engineering support or non-invasive execution
-  tracing hardware this project doesn't have.
+  - **Root cause found and confirmed: this is a hardware brown-out reset,
+    not a software/RF-driver hang.** A diagnostic RAM trace ring buffer
+    (written continuously during normal operation, readable via a plain
+    JTAG memory read after a hang - unlike live register snapshots, this
+    doesn't require disturbing the system to observe it, sidestepping the
+    observation-changes-the-outcome problem above) showed the firmware's
+    own application state reading as **pre-C-runtime-init defaults**
+    during a hang (`channel=0`, not its real static initializer `11`;
+    `traceSeq=0`, never incremented) with `PC` parked in TI's on-chip boot
+    ROM (`0x10001366`/`0x10000891`, address range `0x10000000+`, not this
+    firmware's flash) - reproduced identically twice. That signature means
+    the chip had undergone an actual hardware reset and stalled very early
+    in its own boot sequence, before the application ever ran again.
+    Confirmed directly (not inferred) by reading `AON_PMCTL.RESETCTL`
+    (`0x58090028`, `RESET_SRC` field at bits `[3:1]`) live during a third
+    reproduction: **`RESET_SRC = 2 = VDDS_LOSS`** - a genuine, hardware-
+    latched brown-out-on-the-main-supply-rail reset cause, recorded by the
+    chip's own fault-latching circuit, read immediately after the hang and
+    before any recovery action touched the board. The CC1354P10's
+    integrated PA can hit +20dBm; the current step when sub-1GHz
+    continuous-carrier TX keys up is a real, fast edge that this board's
+    power delivery (LP_EM_CC1354P10_1 + standalone LP-XDS110, often
+    powered over a jumper/ribbon connection) evidently can't sustain
+    without the rail dipping below the brown-out threshold. This also
+    explains why a bare JTAG attach (no target reset) reliably "fixes" a
+    hang: the debug port forcing its own power domain active is plausibly
+    exactly the missing signal the boot ROM's own stalled init sequence
+    needed, not anything to do with waking a sleeping CPU as earlier,
+    retracted theories in this document proposed.
+  - This is a **hardware power-delivery issue, not a firmware bug** -
+    nothing in this project's C code caused it or can reliably prevent it.
+    It explains, after the fact, why every purely software-side fix tried
+    above (status codes, `RF_yield()`, standby/idle constraints, callback-
+    based command completion) never changed the outcome: none of them
+    touch the actual cause. Mitigation belongs on the hardware side -
+    powering the board from a clean bench supply rather than through the
+    debug probe's jumper/ribbon path, and/or reducing sub-1GHz TX output
+    power in `kb_cc1354p10.syscfg`'s PHY config, are the concrete next
+    experiments, not yet tried in this project.
+
+  **Bottom line:** sustained sub-1GHz TX activity (constant jam, or
+  several back-to-back inject packets) can trigger a real brown-out reset
+  on this specific hardware setup, landing the chip in a stalled boot-ROM
+  state that needs the JTAG UART-resync step above (or a physical power
+  cycle) to recover from - confirmed via the chip's own hardware reset-
+  cause register, not a software hang this firmware can fix.
 
 ## Wire protocol
 
