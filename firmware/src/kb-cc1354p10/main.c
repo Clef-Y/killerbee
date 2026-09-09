@@ -334,6 +334,15 @@ static void rfSniffStop(void)
  * future command genuinely never finishes. `okStatus` is the command
  * family's own "done ok" code (generic DONE_OK for CMD_FS/CMD_TX_TEST,
  * IEEE_DONE_OK for CMD_IEEE_TX/CMD_IEEE_RX). */
+/* Tried a variant of this function that registers a real
+ * RF_EventLastCmdDone callback + bounded sem_timedwait() instead of
+ * polling op->status directly, on the theory that the driver's internal
+ * queue bookkeeping might need its own ISR-driven event processing before
+ * it's safe to post the next command, and that polling the status field
+ * directly might race ahead of that. Tested directly against the
+ * reliable count=3 sub-1GHz repro: no improvement, hung identically.
+ * Reverted to plain status polling - simpler, and already validated
+ * across extensive 2.4GHz testing this session. See README/git history. */
 static bool rfPostAndPoll(RF_Op *op, uint16_t okStatus)
 {
     RF_CmdHandle h = RF_postCmd(rfHandle, op, RF_PriorityNormal, NULL, 0);

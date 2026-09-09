@@ -244,6 +244,18 @@ firmware can fix.
     by this correction, since those are always-on core-debug registers,
     not power-domain-gated peripheral ones - so that part of the picture
     still stands.
+  - Also tried the specific idea (raised independently, matching a common
+    TI troubleshooting recommendation) that `rfPostAndPoll()` polling
+    `op->status` directly, instead of waiting on a real driver callback,
+    might let the RF driver's own internal queue bookkeeping get raced
+    ahead of - i.e. posting the next command before the driver's ISR has
+    actually finished processing the previous command's completion event.
+    Rewrote it to register a genuine `RF_EventLastCmdDone` callback and
+    wait on a `sem_timedwait()`-bounded semaphore instead of polling.
+    Tested directly against the reliable `count=3` sub-1GHz repro: **no
+    change, hung identically.** Reverted to the simpler status-polling
+    version, which is already validated across extensive 2.4 GHz testing
+    this session and doesn't carry the added complexity for no benefit.
 
   **Honest bottom line:** the sub-1GHz radio path on this chip has a real,
   reproducible reliability limitation under sustained TX activity, and a
