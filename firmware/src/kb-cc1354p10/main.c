@@ -50,7 +50,6 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <semaphore.h>
-#include <time.h>
 
 #include <ti/drivers/UART2.h>
 #include <ti/drivers/GPIO.h>
@@ -271,10 +270,6 @@ static void *rfForwardThread(void *arg0)
  * since, unlike CMD_IEEE_RX, CMD_PROP_RX has no channel field of its own. */
 static bool rfTuneToChannel(uint8_t ch);
 
-/* Forward declaration - rfSniffStop() needs the bounded RF_cancelCmd()
- * wrapper defined down in the jammer section (shared with rfJamStop()). */
-static void rfCancelCmdBounded(RF_CmdHandle h);
-
 static bool rfSniffStartSubg(uint8_t ch)
 {
     if (!rfTuneToChannel(ch)) {
@@ -321,9 +316,8 @@ static bool rfSniffStart(uint8_t ch)
 static void rfSniffStop(void)
 {
     if (sniffCmdHandle != RF_ALLOC_ERROR) {
-        RF_CmdHandle h = sniffCmdHandle;
+        RF_cancelCmd(rfHandle, sniffCmdHandle, 0);
         sniffCmdHandle = RF_ALLOC_ERROR;
-        rfCancelCmdBounded(h);
     }
 }
 
@@ -405,6 +399,28 @@ static bool rfTransmitOnce(const uint8_t *frame, uint8_t len)
 #define JAM_MODE_CONSTANT   0x00
 #define JAM_MODE_REFLEXIVE  0x01
 
+/* IMPORTANT - sub-1GHz constant-carrier jamming breaks UART communication
+ * as soon as it STARTS, not specifically when it's stopped. Verified: a
+ * plain GET_CHANNEL (touches no RF state at all, just a UART round trip)
+ * sent immediately after a successful sub-1GHz JAMMER_ON ack already gets
+ * no reply, and this never self-recovers (polled 40s with zero external
+ * intervention). The identical test on the 2.4 GHz jammer gets an
+ * immediate, correct GET_CHANNEL reply, so this is specific to the
+ * sub-1GHz (LO-divider) radio path, not "any active jammer".
+ *
+ * What is NOT known for certain: whether the M33 application core itself
+ * is frozen solid (e.g. stuck later in some other unbounded RF driver
+ * wait - see rfJamStop()'s comment on RFCDoorbellSendTo() for one such
+ * mechanism) or whether the core keeps running fine but the physical
+ * UART/USB-serial link itself is desensed/disrupted by the continuous
+ * nearby RF emission. Distinguishing those needs halting the core and
+ * inspecting its PC via the debug port, which wasn't done - the ARM
+ * CoreDebug register access needed for that isn't available through the
+ * simple DSLite CLI used elsewhere in this project. Practically it
+ * doesn't change the prescription either way: don't rely on JAMMER_OFF
+ * (or any other command) to recover a sub-1GHz constant jam once started
+ * - treat starting it as a one-way trip requiring the JTAG UART-resync
+ * step documented above afterward. */
 static rfc_CMD_TX_TEST_t rfCmdTxTest;
 static RF_CmdHandle jamCmdHandle = RF_ALLOC_ERROR;
 
@@ -429,53 +445,35 @@ static bool rfJamStart(uint8_t ch)
     return jamCmdHandle != RF_ALLOC_ERROR;
 }
 
-/* RF_cancelCmd() is documented as a synchronous call that waits for the RF
- * core to actually abort the command. Empirically (full 2.4GHz + sub-1GHz
- * regression test, see README) it can hang indefinitely just like
- * RF_pendCmd()/RF_close() were already found to under this hardware's
- * "stuck RF core" failure mode - reproduced specifically via the sub-1GHz
- * CMD_TX_TEST constant jammer's stop path. Bound the wait in a helper
- * thread and, if RF_cancelCmd doesn't return promptly, fail safe exactly
- * like KB_CMD_RESET does: a full SysCtrlSystemReset() reboot rather than
- * hanging forever. The watchdog thread is simply abandoned in the timeout
- * case (moot - the whole chip reboots). */
-static sem_t jamCancelDoneSem;
-
-static void *jamCancelThread(void *arg)
-{
-    RF_CmdHandle h = (RF_CmdHandle)(intptr_t)arg;
-    RF_cancelCmd(rfHandle, h, 0);
-    sem_post(&jamCancelDoneSem);
-    return NULL;
-}
-
-static void rfCancelCmdBounded(RF_CmdHandle h)
-{
-    sem_init(&jamCancelDoneSem, 0, 0);
-
-    pthread_t t;
-    pthread_attr_t attrs;
-    pthread_attr_init(&attrs);
-    pthread_attr_setdetachstate(&attrs, PTHREAD_CREATE_DETACHED);
-    pthread_attr_setstacksize(&attrs, 768);
-    if (pthread_create(&t, &attrs, jamCancelThread, (void *)(intptr_t)h) != 0) {
-        SysCtrlSystemReset();  /* never returns */
-    }
-
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_sec += 1;  /* generous margin for an abrupt (mode=0) abort */
-    if (sem_timedwait(&jamCancelDoneSem, &ts) != 0) {
-        SysCtrlSystemReset();  /* never returns */
-    }
-}
-
+/* An earlier version of this function tried to bound RF_cancelCmd() with a
+ * watchdog thread + sem_timedwait(), on the theory it might hang like
+ * RF_close() does elsewhere in this file. That "fix" was dead code: reading
+ * the actual (open-source, on this SDK) RF driver
+ * (ti/drivers/rf/RFCC26X2_multiMode.c) shows RF_cancelCmd() -> RF_abortCmd()
+ * wraps everything in Hwi_disable() before calling driverlib's
+ * RFCDoorbellSendTo() (ti/devices/.../driverlib/rfc.c), which is a raw
+ * register spin loop:
+ *
+ *   while(HWREG(RFC_DBELL_BASE + RFC_DBELL_O_CMDR) != 0);
+ *   ...
+ *   while(!HWREG(RFC_DBELL_BASE + RFC_DBELL_O_RFACKIFG));
+ *
+ * waiting for the separate embedded CM0 RF-core co-processor to acknowledge
+ * the abort. Hwi_disable() masks interrupts globally, including the RTOS
+ * scheduler tick, so if that CM0 core never raises the ack flag, the entire
+ * M33 application core freezes solid - no thread (a watchdog included) can
+ * ever be scheduled to notice or recover. Verified directly: triggering
+ * this via the sub-1GHz constant jammer's stop path and polling PING for
+ * 40s with zero external intervention showed no self-recovery at all.
+ *
+ * There is no software fix for a hang already in progress inside that
+ * spin - the only real fix is to never enter it for the specific case
+ * proven to trigger it. See stopJammer() below. */
 static void rfJamStop(void)
 {
     if (jamCmdHandle != RF_ALLOC_ERROR) {
-        RF_CmdHandle h = jamCmdHandle;
+        RF_cancelCmd(rfHandle, jamCmdHandle, 0);
         jamCmdHandle = RF_ALLOC_ERROR;
-        rfCancelCmdBounded(h);
     }
 }
 
@@ -554,7 +552,23 @@ static void *reflexJamThread(void *arg0)
     return NULL;
 }
 
-/* Stops whichever jam mode is currently active. */
+/* Stops whichever jam mode is currently active.
+ *
+ * Constant-carrier jamming on the sub-1GHz PHY is a special case: as
+ * documented above rfJamStart(), UART communication is already gone by
+ * the time anyone would call this (verified: it breaks immediately on
+ * JAMMER_ON, not on stop), so calling stopJammer() via a normal command
+ * dispatch mostly can't happen in practice - the host can't get a
+ * JAMMER_OFF through either. This branch exists for defense in depth
+ * (e.g. SET_CHANNEL/SNIFFER_ON/INJECT's internal "stop jammer first"
+ * calls, reachable if a future fix restores mid-jam communication) and to
+ * avoid ever calling RF_cancelCmd() on a CMD_TX_TEST posted against the
+ * sub-1GHz radio setup - that path goes through RFCDoorbellSendTo()'s
+ * unbounded register spin (see rfJamStop()'s comment), which cannot be
+ * recovered from in software once entered. Forcing an immediate reboot
+ * here is strictly safer than risking that spin, even though in practice
+ * the board usually needs a JTAG-triggered recovery already, for the more
+ * basic reason above. */
 static void stopJammer(void)
 {
     if (jamMode == JAM_MODE_REFLEXIVE) {
@@ -563,6 +577,8 @@ static void stopJammer(void)
             pthread_join(reflexThreadHandle, NULL);
             reflexThreadValid = false;
         }
+    } else if (currentBand == BAND_SUBG) {
+        SysCtrlSystemReset();  /* never returns */
     } else {
         rfJamStop();
     }
@@ -775,6 +791,17 @@ static void handleCommand(uint8_t cmd, const uint8_t *payload, uint8_t len)
     }
 
     case KB_CMD_JAMMER_OFF:
+        if (jammerOn && jamMode == JAM_MODE_CONSTANT && currentBand == BAND_SUBG) {
+            /* Best-effort only: UART communication has empirically already
+             * broken by the time a sub-1GHz constant jam is running (see
+             * rfJamStart()'s comment), so this command dispatch itself
+             * likely never got here over a live link, and this ack likely
+             * won't reach the host either. Kept anyway, mirroring
+             * KB_CMD_RESET, in case a future fix restores mid-jam
+             * communication - harmless no-op if it doesn't. */
+            sendStatus(cmd, STATUS_OK);
+            usleep(50000);
+        }
         stopJammer();
         sendStatus(cmd, STATUS_OK);
         break;

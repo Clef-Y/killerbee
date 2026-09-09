@@ -114,36 +114,65 @@ section above), no reflash needed.
 unconditionally and isn't band-aware; `startJammer()` explicitly rejects
 it while on `BAND_SUBG` rather than silently misbehave) and self-ACK
 (`SET_SELFACK` only takes effect through `CMD_IEEE_RX`'s frame-filter
-options). Constant-carrier jamming (`CMD_TX_TEST`) and plain sniff/inject
-work on both bands.
+options).
 
-**Two real bugs found and fixed by a full 2.4GHz + sub-1GHz regression
-pass** (see git history for the exact commit):
+**The sub-1GHz PHY is meaningfully less reliable than 2.4GHz under
+sustained use** - found by a full regression pass exercising sniff/inject/
+jammer/reset on both bands plus repeated band switching. Two things here
+were genuine firmware bugs and are fixed; a third is a hardware/SDK-level
+reliability limit of the sub-1GHz radio path itself, not something this
+firmware can fix.
 
-- `rfTransmitOnce()`'s sub-1GHz branch checked the TX command's completion
-  status against the generic `DONE_OK` (0x0400), but `CMD_PROP_TX`
-  completes with `PROP_DONE_OK` (0x3400) - a different exact value per
-  `rf_prop_mailbox.h`. `rfPostAndPoll()` does an exact match, so every
-  sub-1GHz `inject()` was rejected immediately (not hung - the status was
-  already `>= 0x0400`, just not equal to the wrong constant being checked).
-  Fixed by including `rf_prop_mailbox.h` and checking `PROP_DONE_OK`.
-- `rfJamStop()`'s and `rfSniffStop()`'s calls to `RF_cancelCmd()` were
-  unbounded, blocking waits - the same unreliable-blocking-wait class of
-  issue as `RF_close()`/`RF_pendCmd()` elsewhere in this file, just via a
-  different TI driver call. This reliably hung when stopping the
-  **sub-1GHz constant-carrier jammer** specifically (2.4 GHz jammer
-  start/stop was unaffected in testing). Fixed with `rfCancelCmdBounded()`:
-  `RF_cancelCmd()` now runs in a helper thread with a 1-second deadline
-  (`sem_timedwait()`); if it doesn't return in time, the firmware fails
-  safe with the same `SysCtrlSystemReset()` full reboot `KB_CMD_RESET`
-  uses, rather than wedging the UART command loop forever. This converts
-  an unrecoverable-without-diagnosis hang into a deterministic ~1s reboot -
-  but **that reboot still needs the JTAG UART-resync workaround above** to
-  talk to the board again afterward, so turning off the sub-1GHz constant
-  jammer can currently cost you the serial connection. Root-causing why
-  `RF_cancelCmd()` itself hangs only for a `CMD_TX_TEST` posted against the
-  sub-1GHz radio setup (and not the 2.4 GHz one) would need deeper access
-  to the RF core/driver internals than this project has visibility into.
+- **Fixed:** `rfTransmitOnce()`'s sub-1GHz branch checked the TX command's
+  completion status against the generic `DONE_OK` (0x0400), but
+  `CMD_PROP_TX` completes with `PROP_DONE_OK` (0x3400) - a different exact
+  value per `rf_prop_mailbox.h`. `rfPostAndPoll()` does an exact match, so
+  every sub-1GHz `inject()` was rejected immediately (not hung - the
+  status was already `>= 0x0400`, just not equal to the wrong constant
+  being checked). Fixed by including `rf_prop_mailbox.h` and checking
+  `PROP_DONE_OK`.
+- **Fixed (by avoidance, not a real fix):** `RF_cancelCmd()` -
+  `RF_abortCmd()` in the RF driver (`ti/drivers/rf/RFCC26X2_multiMode.c`,
+  which - correction from an earlier draft of this doc - is open source on
+  this SDK, not a black box) wraps everything in `Hwi_disable()` before
+  calling driverlib's `RFCDoorbellSendTo()`
+  (`ti/devices/.../driverlib/rfc.c`), which is a raw register spin loop
+  waiting for the separate embedded CM0 RF-core co-processor to
+  acknowledge the abort. `Hwi_disable()` masks interrupts globally,
+  including the RTOS scheduler tick, so if the CM0 core never raises that
+  flag, **the entire M33 application core freezes solid - verified
+  directly by polling PING for 40s with zero external intervention and
+  seeing no self-recovery.** No software timeout (a watchdog thread
+  included - an earlier version of this fix tried exactly that and was
+  dead code, since a timer interrupt can't fire while all interrupts are
+  masked) can recover from this once entered. The only real fix is to
+  never call `RF_cancelCmd()` for the specific case proven to trigger it:
+  `stopJammer()` now calls `SysCtrlSystemReset()` directly instead of
+  `rfJamStop()` when stopping constant-carrier jamming on `BAND_SUBG`,
+  skipping the hazardous call entirely.
+- **Not fixed - a sub-1GHz radio-path reliability limit:** further testing
+  after the above fix found that UART communication actually breaks
+  **as soon as sub-1GHz constant-carrier jamming starts**, not specifically
+  when it's stopped - a plain `GET_CHANNEL` (no RF interaction at all) sent
+  immediately after a successful `JAMMER_ON` ack already gets no reply,
+  with no self-recovery. The identical test on the 2.4 GHz jammer works
+  immediately and correctly. Separately, **three or more consecutive
+  sub-1GHz transmissions** (e.g. `inject(..., count=3)`, regardless of the
+  inter-packet delay) reproduces the same class of freeze, while `count=2`
+  consistently works and `count=3` consistently fails (3/3 reproductions).
+  2.4 GHz `inject(..., count=3)` is unaffected. Whether the M33 core is
+  genuinely frozen (e.g. stuck in another unbounded RF driver wait) or the
+  physical UART/USB-serial link is being desensed by the continuous nearby
+  RF emission was not conclusively determined - that needs halting the
+  core and inspecting its PC via the ARM CoreDebug registers, which isn't
+  available through the simple DSLite CLI used elsewhere in this project.
+  Practically it doesn't change the prescription either way: **treat any
+  sustained sub-1GHz TX activity (constant jam, or 3+ back-to-back inject
+  packets) as something that can end the session and require the JTAG
+  UART-resync step above to recover** - this is a limitation of the
+  sub-1GHz radio path on this SDK/hardware combination (recall its PHY
+  preset is itself labeled "Release Candidate" by TI), not a bug with an
+  available firmware-level fix.
 
 ## Wire protocol
 
