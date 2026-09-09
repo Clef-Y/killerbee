@@ -757,6 +757,17 @@ static void handleCommand(uint8_t cmd, const uint8_t *payload, uint8_t len)
         bool ok = rfTuneToChannel(channel);
         for (uint8_t i = 0; ok && i < count; i++) {
             ok = rfTransmitOnce(frame, frameLen);
+            /* TI's own rfPacketTx reference example (prop_rf) calls
+             * RF_yield() after every single transmit, before preparing the
+             * next one - releasing the RF core's "client active" hold
+             * rather than leaving it continuously powered between posts.
+             * This firmware never did that anywhere. Empirically, 3+
+             * back-to-back sub-1GHz CMD_PROP_TX posts without ever
+             * yielding in between reliably froze UART communication
+             * (count=2 always worked, count=3 never did); 2.4GHz was
+             * unaffected. Matching TI's idiom here specifically to test
+             * and (if it holds) fix that. */
+            RF_yield(rfHandle);
             if (ok && (uint8_t)(i + 1) < count && delayMs > 0) {
                 usleep((unsigned int)delayMs * 1000);
             }

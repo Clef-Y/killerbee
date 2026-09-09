@@ -150,29 +150,70 @@ firmware can fix.
   `stopJammer()` now calls `SysCtrlSystemReset()` directly instead of
   `rfJamStop()` when stopping constant-carrier jamming on `BAND_SUBG`,
   skipping the hazardous call entirely.
-- **Not fixed - a sub-1GHz radio-path reliability limit:** further testing
-  after the above fix found that UART communication actually breaks
-  **as soon as sub-1GHz constant-carrier jamming starts**, not specifically
-  when it's stopped - a plain `GET_CHANNEL` (no RF interaction at all) sent
-  immediately after a successful `JAMMER_ON` ack already gets no reply,
-  with no self-recovery. The identical test on the 2.4 GHz jammer works
-  immediately and correctly. Separately, **three or more consecutive
-  sub-1GHz transmissions** (e.g. `inject(..., count=3)`, regardless of the
-  inter-packet delay) reproduces the same class of freeze, while `count=2`
-  consistently works and `count=3` consistently fails (3/3 reproductions).
-  2.4 GHz `inject(..., count=3)` is unaffected. Whether the M33 core is
-  genuinely frozen (e.g. stuck in another unbounded RF driver wait) or the
-  physical UART/USB-serial link is being desensed by the continuous nearby
-  RF emission was not conclusively determined - that needs halting the
-  core and inspecting its PC via the ARM CoreDebug registers, which isn't
-  available through the simple DSLite CLI used elsewhere in this project.
-  Practically it doesn't change the prescription either way: **treat any
-  sustained sub-1GHz TX activity (constant jam, or 3+ back-to-back inject
-  packets) as something that can end the session and require the JTAG
-  UART-resync step above to recover** - this is a limitation of the
-  sub-1GHz radio path on this SDK/hardware combination (recall its PHY
-  preset is itself labeled "Release Candidate" by TI), not a bug with an
-  available firmware-level fix.
+- **Not fixed - a sub-1GHz radio-path reliability limit, investigated in
+  depth but not resolved:** further testing after the above fix found that
+  UART communication actually breaks **as soon as sub-1GHz constant-carrier
+  jamming starts**, not specifically when it's stopped - a plain
+  `GET_CHANNEL` (no RF interaction at all) sent immediately after a
+  successful `JAMMER_ON` ack already gets no reply, with no self-recovery.
+  The identical test on the 2.4 GHz jammer works immediately and correctly.
+  Separately, **repeated sub-1GHz transmissions** (e.g. `inject(...,
+  count=N)`) can reproduce the same class of freeze.
+
+  Real effort went into fixing this properly, not just documenting around
+  it:
+  - Compared this firmware's RF command usage against TI's own official
+    reference examples for this exact board
+    (`examples/nortos/LP_EM_CC1354P10_1/prop_rf/rfPacketTx` and
+    `rfCarrierWave`, part of the installed SDK). TI's `rfPacketTx.c` calls
+    `RF_yield(rfHandle)` after every single transmit, before preparing the
+    next one - releasing the RF core's "client active" hold between posts.
+    This firmware never did that anywhere. Added it to the `INJECT` TX
+    loop to match. This is a genuine, correct improvement (it's what TI's
+    own validated example does) and measurably changed the failure
+    pattern - a repeated `count=3` test that failed 3/3 times before the
+    change passed cleanly, with the board verified healthy afterward, on
+    the first re-test. **However**, further testing (3 independent fresh
+    reflashes, `count=3` each) showed it still fails most of the time -
+    the failure became less deterministic, not eliminated. This fix is
+    kept (it's correct per TI's own reference and doesn't regress anything
+    that was working), but it should not be relied on as a resolution.
+  - Searched TI's official documentation and e2e support forum. Found a
+    real, TI-acknowledged thread specific to this exact chip:
+    ["CC1354P10: RF transmit Hangs RF_runScheduleCmd() in
+    CC1354P10"](https://e2e.ti.com/support/wireless-connectivity/sub-1-ghz-group/sub-1-ghz/f/sub-1-ghz-forum/1324353/cc1354p10-rf-transmit-hangs-rf_runschedulecmd-in-cc1354p10)
+    (TI E2E, Sub-1 GHz forum) - another user hitting RF transmit hangs on
+    this same device, described as one of the RF core's termination events
+    simply never firing, leaving a blocking wait (there, `RF_pendCmd()`'s
+    semaphore; here, `RFCDoorbellSendTo()`'s register spin) stuck forever.
+    This independently confirms the failure class is a real, known
+    characteristic of this chip's RF core - not something specific to or
+    caused by this project's firmware. TI's own suggested diagnostic in
+    that thread is reading the `RFCPEIFG` register
+    (`RFC_DBELL_BASE + 0x10` = `0x40041010` on this device, per
+    `hw_rfc_dbell.h`) to see the CPE's exact state during a hang.
+  - Tried to actually do that read live during a reproduced hang, without
+    resetting the board first (so as not to destroy the very state being
+    inspected). Could not: any DSLite connection to the target runs this
+    board's configured GEL startup script, which performs a board reset as
+    part of establishing the debug connection - there's no way with the
+    DSLite CLI used throughout this project to attach and read a register
+    without also resetting the chip first. A live, held-open, no-reset-on-
+    attach debug session (e.g. through CCS or a GDB/OpenOCD setup against
+    the XDS110) would be needed to actually read `RFCPEIFG` mid-hang. That
+    wasn't available in this environment.
+
+  **Honest bottom line:** the sub-1GHz radio path on this chip has a real,
+  TI-acknowledged reliability limitation under sustained TX activity that
+  this project could not fully root-cause or fix with the tools and access
+  available - not for lack of trying. `RF_yield()` is a genuine, worthwhile
+  improvement and is kept. Treat any sustained sub-1GHz TX activity
+  (constant jam, or several back-to-back inject packets) as something that
+  can still end the session and require the JTAG UART-resync step above to
+  recover. A real fix, if one exists, most likely needs either TI's direct
+  engineering support, a non-"Release Candidate" PHY preset if TI ships
+  one for this device in the future, or genuine register/PC-level JTAG
+  debugging tooling this project doesn't currently have set up.
 
 ## Wire protocol
 
