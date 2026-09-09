@@ -39,9 +39,9 @@ below.
 | SNIFF            | yes       | Promiscuous `CMD_IEEE_RX` (2.4GHz) / `CMD_PROP_RX` (915MHz), frame filtering off by default |
 | SETCHAN          | yes       | Channels 11-26 (2.4 GHz, page 0) and 1-10 (915 MHz, page 31) |
 | INJECT           | yes       | `CMD_IEEE_TX` (2.4GHz) / `CMD_PROP_TX` (915MHz), hardware auto-computes/appends the FCS |
-| SELFACK          | yes*      | Extra `driver.set_selfack()` method — see caveat below; no generic KillerBee-level setter exists in this codebase for any device. 2.4 GHz only - see Sub-1GHz support |
+| SELFACK          | yes*      | Extra `driver.set_selfack()` method — see caveat below; no generic KillerBee-level setter exists in this codebase for any device. Both bands - hardware auto-ACK on 2.4GHz, software reflex on sub-1GHz (no hardware ACK support in `CMD_PROP_RX` - see "Sub-1GHz support") |
 | PHYJAM           | yes       | Continuous `CMD_TX_TEST` (modulated PRBS-15 garbage) - PHY-agnostic, works on either band |
-| PHYJAM_REFLEX    | yes*      | Best-effort software-loop reflex — see caveat below. 2.4 GHz only - see Sub-1GHz support |
+| PHYJAM_REFLEX    | yes*      | Best-effort software-loop reflex — see caveat below. Both bands - see "Sub-1GHz support" for the sub-1GHz-specific implementation notes |
 | SET_SYNC         | no        | The native IEEE 802.15.4 RX/TX commands use a fixed, standard O-QPSK preamble/SFD; there is no register here to reprogram it (unlike CC2420-style radios) |
 | FREQ_2400        | yes       | |
 | FREQ_915         | yes       | 915 MHz US ISM, channels 1-10 - see "Sub-1GHz support" below |
@@ -109,12 +109,53 @@ recovery used throughout this project's bring-up works: a JTAG-level board
 reset through the debug probe (see the RF-core-stuck troubleshooting
 section above), no reflash needed.
 
-**Not yet supported on the sub-1GHz band:** reflexive jamming
-(`jammer_on(method="reflexive")` - its listen loop posts `CMD_IEEE_RX`
-unconditionally and isn't band-aware; `startJammer()` explicitly rejects
-it while on `BAND_SUBG` rather than silently misbehave) and self-ACK
-(`SET_SELFACK` only takes effect through `CMD_IEEE_RX`'s frame-filter
-options).
+**Reflexive jamming and self-ACK are both supported on the sub-1GHz band**,
+implemented after the brown-out fix above (they'd have been unusable
+before it - both do sustained TX/RX cycling, exactly the pattern that
+triggered the brown-out at the old TX power). Real, working, tested
+implementations, not just capability flags left on:
+
+- **Reflexive jamming** (`jammer_on(method="reflexive")`): `reflexJamThread()`
+  is band-aware - posts `CMD_PROP_RX` for the listen window on `BAND_SUBG`
+  instead of `CMD_IEEE_RX`, and (unlike the 2.4 GHz path, where
+  `CMD_IEEE_RX.channel` carries its own tuning) does an explicit one-time
+  `rfTuneToChannel()` before the loop starts, since `CMD_PROP_RX` has no
+  channel field of its own - missing this was a real bug caught during
+  testing (first attempt hung immediately; the RF synth was left on
+  whatever frequency it was previously at). `rxCallback()`'s existing
+  band-aware append-byte parsing (already needed for plain sniffing) just
+  works here too, no changes needed. Tested: 10+ seconds of sustained
+  reflexive jamming, clean start and stop, no reboot needed on stop
+  (unlike constant-carrier jamming - see below).
+- **Self-ACK** (`SET_SELFACK` / `driver.set_selfack()`): a genuine hardware
+  limitation, not a gap - `CMD_PROP_RX`/`CMD_PROP_RX_ADV` (checked in
+  `rf_prop_cmd.h`) have no auto-ACK field anywhere, unlike `CMD_IEEE_RX`'s
+  `frameFiltOpt.autoAckEn`, which the RF core services entirely in
+  hardware, in parallel with ongoing capture. There's no sub-1GHz
+  equivalent hardware path on this chip. Implemented instead as a software
+  reflex (`selfAckSubgThread()`): a dedicated thread posts `CMD_PROP_RX`
+  indefinitely (as close to continuous as the plain sniffer, not the
+  jammer's short bursts) into the same shared capture ring `pnext()`
+  already reads from - normal capture keeps working unchanged. When a
+  frame lands with the IEEE 802.15.4 Ack Request bit set (frame control
+  byte 0, bit 5) and a valid CRC, the ongoing RX is briefly cancelled (safe
+  for `CMD_PROP_RX` - the doorbell-spin hazard documented elsewhere in this
+  file was specific to cancelling `CMD_TX_TEST`, verified extensively
+  through sniffer testing all session), a 3-byte immediate ACK (FCF
+  `0x02 0x00` + the frame's sequence number) is sent, and RX is re-armed.
+  This costs a real cancel+TX+re-arm round trip per ACK (not
+  hardware-instant like 2.4 GHz), and acks any request with no destination
+  address filtering - matching the level of address-awareness this
+  firmware's 2.4 GHz self-ACK already has, since no local address/PAN ID is
+  configured anywhere in this file for either band. Tested for mechanical
+  soundness (start/stop stability, sustained operation, mid-sniff toggling,
+  repeated cycling - all clean, no hangs) but **not validated against a
+  real over-the-air ACK-requesting transmitter** - no second sub-1GHz
+  device was available this session to confirm a real node actually
+  recognizes the ACK format as valid and stops retransmitting. Treat the
+  mechanism as sound and the frame format as correct per the 802.15.4
+  spec, but genuinely unverified end-to-end, same caveat as the PHY
+  preset's decode accuracy elsewhere in this document.
 
 **The sub-1GHz PHY was meaningfully less reliable than 2.4GHz under
 sustained use, traced to a real hardware brown-out reset and now

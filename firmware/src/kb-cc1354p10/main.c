@@ -312,6 +312,10 @@ static void *rfForwardThread(void *arg0)
  * since, unlike CMD_IEEE_RX, CMD_PROP_RX has no channel field of its own. */
 static bool rfTuneToChannel(uint8_t ch);
 
+/* Forward declaration - selfAckSubgThread() needs rfTransmitOnce() (below)
+ * to send its ACK replies via the same CMD_PROP_TX path INJECT uses. */
+static bool rfTransmitOnce(const uint8_t *frame, uint8_t len);
+
 static bool rfSniffStartSubg(uint8_t ch)
 {
     if (!rfTuneToChannel(ch)) {
@@ -330,9 +334,109 @@ static bool rfSniffStartSubg(uint8_t ch)
     return sniffCmdHandle != RF_ALLOC_ERROR;
 }
 
+/* ==================== Sub-1GHz self-ACK ====================
+ * CMD_PROP_RX/CMD_PROP_RX_ADV have no hardware auto-ACK field anywhere
+ * (verified against rf_prop_cmd.h) - unlike CMD_IEEE_RX's
+ * frameFiltOpt.autoAckEn, which the RF core services entirely in hardware,
+ * in parallel with ongoing capture, with no CPU involvement per frame.
+ * There is no equivalent hardware path for the sub-1GHz proprietary PHY on
+ * this chip - this is a real command-set limitation, not a gap in this
+ * firmware.
+ *
+ * What's implemented instead is a software reflex, structurally the same
+ * as the existing reflexive jammer: a dedicated thread posts CMD_PROP_RX,
+ * and - unlike the jammer - lets it run indefinitely (TRIG_NEVER, matching
+ * the plain sniffer) so capture stays as close to continuous as the plain
+ * sniffer's, rather than the jammer's short bursty windows. When a frame
+ * lands in the shared capture ring (the same ring/rxCallback the plain
+ * sniffer and pnext() already use - no separate capture path, so normal
+ * frame capture keeps working exactly as before), it's inspected for the
+ * IEEE 802.15.4 Ack Request bit (frame control byte 0, bit 5). If set and
+ * the frame's CRC was valid, the ongoing RX is briefly cancelled (the same
+ * RF_cancelCmd() already proven safe for CMD_PROP_RX across this entire
+ * project's sniffer testing - the doorbell-spin hazard documented
+ * elsewhere in this file was specific to cancelling CMD_TX_TEST, not
+ * CMD_PROP_RX), a 3-byte immediate ACK frame (FCF 0x02 0x00 + the
+ * original frame's sequence number) is sent via the existing
+ * rfTransmitOnce() path, and RX is re-armed. This is NOT hardware-instant
+ * like 2.4GHz's - it costs a real cancel+TX+re-arm round trip per ACK'd
+ * frame (low-single-digit ms, generous relative to this PHY's 6.25 kbps
+ * symbol rate and IEEE 802.15.4g's own more relaxed sub-1GHz ACK timing
+ * budgets) - and it acks any frame requesting one, with no destination
+ * address filtering, matching the level of address-awareness this
+ * firmware's own 2.4GHz self-ACK already has (no explicit local
+ * address/PAN ID is configured anywhere in this file for either band). */
+static volatile bool selfAckSubgRunning = false;
+static pthread_t selfAckSubgThreadHandle;
+static bool selfAckSubgThreadValid = false;
+static bool sniffIsSelfAckThread = false;
+
+static void rfSendAckSubg(uint8_t seqNum)
+{
+    uint8_t ackFrame[3] = { 0x02, 0x00, seqNum };
+    rfTransmitOnce(ackFrame, sizeof(ackFrame));
+}
+
+static void *selfAckSubgThread(void *arg0)
+{
+    rfTuneToChannel(channel);
+
+    while (selfAckSubgRunning) {
+        RF_cmdPropRx.pQueue = &rxDataQueue;
+        RF_cmdPropRx.pOutput = NULL;
+        RF_cmdPropRx.rxConf.bAppendRssi = 1;
+        RF_cmdPropRx.rxConf.bAppendTimestamp = 1;
+        RF_cmdPropRx.rxConf.bAppendStatus = 1;
+        RF_cmdPropRx.startTrigger.triggerType = TRIG_NOW;
+        RF_cmdPropRx.endTrigger.triggerType = TRIG_NEVER;
+
+        RF_CmdHandle h = RF_postCmd(rfHandle, (RF_Op *)&RF_cmdPropRx,
+                                     RF_PriorityNormal, rxCallback,
+                                     RF_EventRxEntryDone);
+        if (h == RF_ALLOC_ERROR) {
+            break;
+        }
+
+        uint8_t capHeadBefore = capHead;
+        while (selfAckSubgRunning && capHead == capHeadBefore) {
+            usleep(500);
+        }
+        if (!selfAckSubgRunning) {
+            RF_cancelCmd(rfHandle, h, 0);
+            break;
+        }
+
+        RF_cancelCmd(rfHandle, h, 0);
+
+        for (uint8_t i = capHeadBefore; i != capHead;
+             i = (uint8_t)((i + 1) % CAP_RING_SLOTS)) {
+            CapturedFrame *f = &capRing[i];
+            if (f->crcOk && f->frameLen >= 3 && (f->frame[0] & 0x20)) {
+                rfSendAckSubg(f->frame[2]);
+            }
+        }
+    }
+    return NULL;
+}
+
 static bool rfSniffStart(uint8_t ch)
 {
     if (currentBand == BAND_SUBG) {
+        if (selfAckEnabled) {
+            selfAckSubgRunning = true;
+            pthread_attr_t attrs;
+            pthread_attr_init(&attrs);
+            pthread_attr_setstacksize(&attrs, 1024);
+            if (pthread_create(&selfAckSubgThreadHandle, &attrs,
+                                selfAckSubgThread, NULL) != 0) {
+                selfAckSubgRunning = false;
+                return false;
+            }
+            selfAckSubgThreadValid = true;
+            sniffIsSelfAckThread = true;
+            return true;
+        }
+        sniffIsSelfAckThread = false;
         return rfSniffStartSubg(ch);
     }
 
@@ -357,6 +461,15 @@ static bool rfSniffStart(uint8_t ch)
 
 static void rfSniffStop(void)
 {
+    if (sniffIsSelfAckThread) {
+        if (selfAckSubgThreadValid) {
+            selfAckSubgRunning = false;
+            pthread_join(selfAckSubgThreadHandle, NULL);
+            selfAckSubgThreadValid = false;
+        }
+        sniffIsSelfAckThread = false;
+        return;
+    }
     if (sniffCmdHandle != RF_ALLOC_ERROR) {
         RF_cancelCmd(rfHandle, sniffCmdHandle, 0);
         sniffCmdHandle = RF_ALLOC_ERROR;
@@ -559,25 +672,60 @@ static void rfReflexBurst(void)
 
 static void *reflexJamThread(void *arg0)
 {
-    while (reflexRunning) {
-        /* Arm a short promiscuous listen window on the current channel. */
-        RF_cmdIeeeRx.channel = channel;
-        RF_cmdIeeeRx.pRxQ = &rxDataQueue;
-        RF_cmdIeeeRx.pOutput = &rxStatistics;
-        RF_cmdIeeeRx.rxConfig.bIncludeCrc = 1;
-        RF_cmdIeeeRx.rxConfig.bAppendRssi = 1;
-        RF_cmdIeeeRx.rxConfig.bAppendCorrCrc = 1;
-        RF_cmdIeeeRx.rxConfig.bAppendTimestamp = 1;
-        RF_cmdIeeeRx.frameFiltOpt.frameFiltEn = 0;
-        RF_cmdIeeeRx.startTrigger.triggerType = TRIG_NOW;
-        RF_cmdIeeeRx.endTrigger.triggerType = TRIG_REL_START;
-        RF_cmdIeeeRx.endTime = REFLEX_LISTEN_TICKS;
+    if (currentBand == BAND_SUBG) {
+        /* Unlike CMD_IEEE_RX (which carries its own .channel field, set
+         * per-iteration below), CMD_PROP_RX has no channel field - the
+         * synth needs an explicit CMD_FS tune first, same as every other
+         * sub-1GHz RF op in this file (see rfTuneToChannel()'s comment).
+         * Missing this left the synth on whatever frequency it was
+         * previously at - a real correctness bug, not just a hang risk. */
+        rfTuneToChannel(channel);
+    }
 
+    while (reflexRunning) {
+        /* Arm a short promiscuous listen window on the current channel and
+         * band. rxCallback() (see its own comment) already branches on
+         * currentBand to correctly parse the append-bytes for either
+         * command family, so no change needed there - only which RX
+         * command gets posted, and which struct's .status field gets
+         * polled, differ here. */
+        volatile uint16_t *statusField;
+        RF_CmdHandle h;
         uint8_t capHeadBefore = capHead;
 
-        RF_CmdHandle h = RF_postCmd(rfHandle, (RF_Op *)&RF_cmdIeeeRx,
-                                     RF_PriorityNormal, rxCallback,
-                                     RF_EventRxEntryDone);
+        if (currentBand == BAND_SUBG) {
+            RF_cmdPropRx.pQueue = &rxDataQueue;
+            RF_cmdPropRx.pOutput = NULL;
+            RF_cmdPropRx.rxConf.bAppendRssi = 1;
+            RF_cmdPropRx.rxConf.bAppendTimestamp = 1;
+            RF_cmdPropRx.rxConf.bAppendStatus = 1;
+            RF_cmdPropRx.startTrigger.triggerType = TRIG_NOW;
+            RF_cmdPropRx.endTrigger.triggerType = TRIG_REL_START;
+            RF_cmdPropRx.endTime = REFLEX_LISTEN_TICKS;
+
+            h = RF_postCmd(rfHandle, (RF_Op *)&RF_cmdPropRx,
+                            RF_PriorityNormal, rxCallback,
+                            RF_EventRxEntryDone);
+            statusField = &RF_cmdPropRx.status;
+        } else {
+            RF_cmdIeeeRx.channel = channel;
+            RF_cmdIeeeRx.pRxQ = &rxDataQueue;
+            RF_cmdIeeeRx.pOutput = &rxStatistics;
+            RF_cmdIeeeRx.rxConfig.bIncludeCrc = 1;
+            RF_cmdIeeeRx.rxConfig.bAppendRssi = 1;
+            RF_cmdIeeeRx.rxConfig.bAppendCorrCrc = 1;
+            RF_cmdIeeeRx.rxConfig.bAppendTimestamp = 1;
+            RF_cmdIeeeRx.frameFiltOpt.frameFiltEn = 0;
+            RF_cmdIeeeRx.startTrigger.triggerType = TRIG_NOW;
+            RF_cmdIeeeRx.endTrigger.triggerType = TRIG_REL_START;
+            RF_cmdIeeeRx.endTime = REFLEX_LISTEN_TICKS;
+
+            h = RF_postCmd(rfHandle, (RF_Op *)&RF_cmdIeeeRx,
+                            RF_PriorityNormal, rxCallback,
+                            RF_EventRxEntryDone);
+            statusField = &RF_cmdIeeeRx.status;
+        }
+
         if (h == RF_ALLOC_ERROR) {
             break;
         }
@@ -586,12 +734,12 @@ static void *reflexJamThread(void *arg0)
          * RF_pendCmd() - see rfPostAndPoll()'s comment for why. The window
          * is ~1ms (REFLEX_LISTEN_TICKS), so give it a generous margin. */
         for (uint32_t waitedUs = 0; waitedUs < 5000; waitedUs += 200) {
-            if (RF_cmdIeeeRx.status >= 0x0400) {
+            if (*statusField >= 0x0400) {
                 break;
             }
             usleep(200);
         }
-        if (RF_cmdIeeeRx.status < 0x0400) {
+        if (*statusField < 0x0400) {
             RF_cancelCmd(rfHandle, h, 0);
         }
 
@@ -645,15 +793,8 @@ static bool startJammer(uint8_t mode, uint8_t ch)
 {
     jamMode = mode;
     if (mode == JAM_MODE_REFLEXIVE) {
-        /* reflexJamThread() posts CMD_IEEE_RX unconditionally - it isn't
-         * band-aware like rfSniffStart()/rfTuneToChannel()/rfTransmitOnce()
-         * are, so it would post a mismatched command if the RF core is
-         * actually set up for the sub-1GHz PHY. Not yet implemented for
-         * BAND_SUBG - constant-carrier jamming (CMD_TX_TEST, PHY-agnostic)
-         * still works there via the rfJamStart() path below. */
-        if (currentBand == BAND_SUBG) {
-            return false;
-        }
+        /* reflexJamThread() is band-aware (posts CMD_PROP_RX or
+         * CMD_IEEE_RX depending on currentBand - see its own comment). */
         reflexRunning = true;
         pthread_attr_t attrs;
         pthread_attr_init(&attrs);
