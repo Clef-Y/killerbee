@@ -257,23 +257,74 @@ firmware can fix.
     version, which is already validated across extensive 2.4 GHz testing
     this session and doesn't carry the added complexity for no benefit.
 
+  - Got a genuine live, halted debug session working (something an earlier
+    pass of this investigation said wasn't available) via TI's Debug Server
+    Scripting (DSS, `ccs_base/scripting/run.sh` - a real JS API distinct
+    from the plain DSLite CLI used everywhere else in this project:
+    `session.target.connect()/halt()/run()`, `session.registers.read()`,
+    `session.memory.readOne()`). Pointed it at the same no-reset scratchpad
+    ccxml already built for the read-only register work above.
+  - First capture during a reproduced hang: `PC=0x329a`, one instruction
+    past a `wfi` inside `PowerCC26XX_standbyPolicy` (confirmed via
+    disassembly - the specific branch taken there requires both
+    `PowerCC26XX_DISALLOW_STANDBY` and `_DISALLOW_IDLE` to be set, i.e. the
+    constraint added earlier in this investigation). `XPSR`'s exception
+    field read `0` (Thread mode), independently corroborating the earlier
+    `ICSR.VECTACTIVE=0` finding via a different register. This looked like
+    strong confirmation of "CPU legitimately parked in WFI, waiting for an
+    interrupt that never arrives" - consistent with why a bare debug attach
+    (which can generate a wake event on this architecture) fixes it.
+  - **Ran the identical halt-and-inspect against a healthy, idle board as a
+    control - the same discipline that caught the earlier `RFC_ON`
+    misdiagnosis - and it produced the exact same `PC=0x329a`.** A
+    perfectly normal, unhung board looks identical at this level of
+    inspection. That specific finding is retracted as diagnostic evidence
+    for the same reason as before: it's what any idle CPU looks like, hang
+    or not.
+  - Added NVIC inspection (`ISER`/`ISPR`/`IABR` at `0xE000E100`-`0xE000E304`)
+    to check enabled/pending/active state for the RF and UART interrupt
+    lines (`RFC_CPE_0`=25, `RFC_CPE_1`=18, `RFC_HW_COMB`=26,
+    `RFC_CMD_ACK`=27, `UART2_COMB`=56, `AON_RTC_COMB`=20, per
+    `hw_ints.h`). A second hang capture showed something more striking -
+    `PC` inside ROM (`0x10001366`, not this firmware's flash) with **every
+    NVIC interrupt-enable bit cleared** - versus the healthy control's
+    `ISER0=0x12000631` (several real interrupts enabled, `RFC_CPE_0`
+    included). A CPU with zero enabled interrupts would explain why nothing
+    could wake it. **Not treating this as confirmed root cause**, though:
+    the two hang captures are inconsistent with each other (different PC,
+    different NVIC state), and connecting via JTAG is itself established as
+    capable of waking a WFI-parked CPU - so a `halt()` a few instructions
+    into whatever ROM wake/power-reconfiguration routine that triggered,
+    which commonly disable interrupts as their own internal critical
+    section, is indistinguishable from a genuine "nothing was ever going to
+    wake this" state using this tooling. This is a real methodological
+    wall, not a lack of effort: getting a clean, undisturbed snapshot would
+    need non-invasive execution tracing (an ETM trace probe), which isn't
+    available here - every tool this project has requires an attach that's
+    already shown itself capable of changing the outcome.
+
   **Honest bottom line:** the sub-1GHz radio path on this chip has a real,
   reproducible reliability limitation under sustained TX activity, and a
   real, TI-acknowledged forum report of the same failure class exists for
-  this exact chip - so this isn't specific to this project's firmware.
-  Root cause is still not identified. Two genuine improvements were made
-  and kept (`RF_yield()`, permanent standby/idle disallow) because they're
-  correct per TI's own reference code, but neither fixed the underlying
-  issue, and one promising lead (RF power domain collapsing) turned out to
-  be a misread diagnostic, caught and retracted by cross-checking against
-  TI's own unmodified reference firmware rather than left standing.
-  Treat any sustained sub-1GHz TX activity (constant jam, or several
-  back-to-back inject packets) as something that can still end the session
-  and require the JTAG UART-resync step above to recover. A real fix, if
-  one exists, most likely needs TI's direct engineering support or a live,
-  halted JTAG/GDB debug session capable of correctly sequencing
-  power-domain access to peripheral registers - neither of which this
-  project has available.
+  this exact chip - so this isn't specific to this project's firmware. Root
+  cause is still not conclusively identified, though the evidence leans
+  toward the M33 core legitimately sleeping (not crashed, not spin-locked)
+  and waiting on an interrupt that the wedged sub-1GHz RF core stops
+  delivering - a bare JTAG attach's architectural wake side-effect is the
+  most consistent explanation found for why that alone (no reset needed)
+  recovers it. Two genuine improvements were made and kept (`RF_yield()`,
+  permanent standby/idle disallow) because they're correct per TI's own
+  reference code, but neither fixed the underlying issue. Two separate
+  leads (RF power domain collapsing; PC parked in a specific WFI location)
+  were built up with real evidence and then retracted after failing a
+  control-test cross-check against known-good hardware - left in this
+  document rather than quietly dropped, since the retraction is as
+  informative as the original claim would have been. Treat any sustained
+  sub-1GHz TX activity (constant jam, or several back-to-back inject
+  packets) as something that can still end the session and require the
+  JTAG UART-resync step above to recover. A real fix, if one exists, most
+  likely needs TI's direct engineering support or non-invasive execution
+  tracing hardware this project doesn't have.
 
 ## Wire protocol
 
