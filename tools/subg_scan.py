@@ -12,8 +12,10 @@ SDK) rather than assumed - see firmware/src/kb-cc1354p10/README.md's
 wrong channel plan this project used before being corrected), each for a
 configurable dwell time, and writes:
 
-  - one libpcap file per channel with any captured traffic
-    (readable in Wireshark, or by killerbee/zbdump/zbconvert etc.)
+  - one libpcap file per channel that captured at least one packet -
+    channels with zero activity are left out entirely, not written as an
+    empty header-only file (readable in Wireshark, or by
+    killerbee/zbdump/zbconvert etc.)
   - a detailed per-channel + summary text report
   - a JSON file with the full structured results, for scripted reuse
 
@@ -124,10 +126,17 @@ def decode_frame(raw: bytes) -> Dict[str, Any]:
 
 def scan_channel(kb: KillerBee, ch: int, dwell: float, pcap_path: str,
                   poll: float = 0.5) -> List[Dict[str, Any]]:
+    """Listens on channel ch for dwell seconds. The pcap file at pcap_path
+    is only created on the *first* captured packet (lazy open) - a
+    channel with zero activity leaves no pcap file behind at all, rather
+    than a 24-byte empty-header file. Every prior scan on this project has
+    turned up mostly-empty channels; this keeps output directories to
+    just the channels that actually had something, instead of dozens of
+    files that are only ever libpcap headers with nothing in them."""
     kb.set_channel(ch, page=31)
     kb.sniffer_on()
 
-    dumper = PcapDumper(DLT_IEEE802_15_4, pcap_path)
+    dumper: Optional[PcapDumper] = None
     packets: List[Dict[str, Any]] = []
     t_end = time.time() + dwell
 
@@ -154,9 +163,12 @@ def scan_channel(kb: KillerBee, ch: int, dwell: float, pcap_path: str,
             record.update(decode_frame(raw))
             packets.append(record)
 
+            if dumper is None:
+                dumper = PcapDumper(DLT_IEEE802_15_4, pcap_path)
             dumper.pcap_dump(raw, ant_dbm=pkt.get("rssi"), freq_mhz=FREQ_MHZ[ch])
     finally:
-        dumper.close()
+        if dumper is not None:
+            dumper.close()
         kb.sniffer_off()
 
     return packets
@@ -269,8 +281,11 @@ def main() -> None:
             results[ch] = packets
             scanned.append(ch)
             valid = sum(1 for p in packets if p["crc_ok"])
-            print("  %d packet(s) captured (%d valid CRC) -> %s"
-                  % (len(packets), valid, pcap_path))
+            if packets:
+                print("  %d packet(s) captured (%d valid CRC) -> %s"
+                      % (len(packets), valid, pcap_path))
+            else:
+                print("  0 packets captured - no pcap written")
     except KeyboardInterrupt:
         print("\nInterrupted - writing report for the %d channel(s) completed so far."
               % len(scanned))
@@ -296,8 +311,11 @@ def main() -> None:
             "results": results,
         }, f, indent=2, default=str)
 
-    print("\nWrote %s and %s (plus one .pcap per channel) in %s"
-          % (os.path.basename(report_path), os.path.basename(json_path), outdir))
+    pcap_count = sum(1 for ch in scanned if results.get(ch))
+    print("\nWrote %s and %s (plus %d .pcap file(s), one per channel with "
+          "activity) in %s"
+          % (os.path.basename(report_path), os.path.basename(json_path),
+             pcap_count, outdir))
 
 
 if __name__ == "__main__":
