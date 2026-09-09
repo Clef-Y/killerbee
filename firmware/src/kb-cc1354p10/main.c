@@ -45,6 +45,7 @@
  */
 
 #include <stdint.h>
+#include <math.h>
 #include <stdbool.h>
 #include <string.h>
 #include <unistd.h>
@@ -520,18 +521,48 @@ static bool rfPostAndPoll(RF_Op *op, uint16_t okStatus)
  * whatever frequency the synth is currently tuned to, so an explicit
  * CMD_FS is required before any of them, regardless of prior state.
  *
- * Channel-to-frequency mapping for BAND_SUBG follows the classic IEEE
- * 802.15.4-2006 915 MHz US ISM band plan (channels 1-10, 906 + 2*(ch-1)
- * MHz - 906..924 MHz) rather than KillerBee's own kbutils.py page-31
- * frequency() helper, which uses a denser/different spacing more suited
- * to a generic SUN-PHY channel plan - channels 1-10 specifically was the
- * explicit ask this was built for, and matches the real, well-known
- * standard channel numbering. */
+ * Channel-to-frequency mapping for BAND_SUBG: an earlier version of this
+ * function used the classic IEEE 802.15.4-2006 O-QPSK band plan (channels
+ * 1-10, 906 + 2*(ch-1) MHz, 2 MHz spacing) - wrong for the PHY actually in
+ * use here. This firmware runs SUN O-QPSK Rate Mode 0 (IEEE 802.15.4g,
+ * folded into 802.15.4-2015/2020), which has its own, different, real
+ * standard channel plan for the 902-928 MHz US band - verified directly
+ * against TI's own ti154stack (their real IEEE 802.15.4g/SUN protocol
+ * stack implementation, source-available in the installed SDK) rather
+ * than assumed:
+ *   ti/ti154stack/high_level/mac_pib.h:
+ *     MAC_5KBPS_915MHZ_BAND_MODE_1_CENTER_FREQ_KHZ  = 902200
+ *     MAC_5KBPS_915MHZ_BAND_MODE_1_CHAN_SPACING_KHZ = 200
+ *     MAC_5KBPS_915MHZ_BAND_MODE_1_TOTAL_CHANNELS   = 129
+ * ("5KBPS_915MHZ" is TI's own name for this exact rate mode - the same
+ * one SysConfig's radioconfig tool calls "qpsk6kbpsrm0"/Rate Mode 0).
+ * So: channel n (0-128) -> 902.2 + 0.2*n MHz, spanning 902.2-927.8 MHz -
+ * these are the real, standard channel numbers a real SUN/802.15.4g
+ * device would use, not firmware-invented ones. Sub-MHz precision needs
+ * CMD_FS's fractFreq field (frequency = integer MHz, fractFreq = the
+ * fractional part as a 16-bit fraction of 1 MHz, i.e. actual tuned
+ * frequency = frequency + fractFreq/65536 MHz - verified against TI's own
+ * SysConfig radioconfig code generator,
+ * ti/devices/radioconfig/.meta/cmd_handler.js, which computes exactly
+ * this and additionally rounds to the nearest multiple of 51.2 to match
+ * the synth's native step size, replicated here for the same fidelity).
+ *
+ * KillerBee's own kbutils.py page-31 frequency() helper uses yet another,
+ * different formula - this mapping intentionally does not match it either;
+ * see README.md's Sub-1GHz support section for that caveat, still true. */
 static bool rfTuneToChannel(uint8_t ch)
 {
     if (currentBand == BAND_SUBG) {
-        RF_cmdFsSubg.frequency = (uint16_t)(906 + 2 * (ch - 1));
-        RF_cmdFsSubg.fractFreq = 0;
+        /* Floating point (this core has an FPU; this runs once per channel
+         * change, not a hot loop) to mirror TI's own conversion exactly
+         * rather than approximate it with integer rounding tricks. */
+        double freqMHz = (902200.0 + 200.0 * (double)ch) / 1000.0;
+        double intPart = floor(freqMHz);
+        double fractRaw = (freqMHz - intPart) * 65536.0;
+        double fractCmd = ceil(round(fractRaw / 51.2) * 51.2);
+
+        RF_cmdFsSubg.frequency = (uint16_t)intPart;
+        RF_cmdFsSubg.fractFreq = (uint16_t)fractCmd;
         return rfPostAndPoll((RF_Op *)&RF_cmdFsSubg, DONE_OK);
     }
 
@@ -877,8 +908,10 @@ static void handleCommand(uint8_t cmd, const uint8_t *payload, uint8_t len)
         uint8_t newChannel = payload[0];
         uint8_t newPage = (len == 2) ? payload[1] : 0;
         trace(TR_SET_CHANNEL_REQ, newPage);
+        /* page 31 range is 0-128 (129 channels) - the real SUN O-QPSK
+         * Rate Mode 0 channel plan, see rfTuneToChannel()'s comment. */
         bool validRange = (newPage == 0 && newChannel >= 11 && newChannel <= 26)
-                        || (newPage == 31 && newChannel >= 1 && newChannel <= 10);
+                        || (newPage == 31 && newChannel <= 128);
         if (!validRange) {
             sendStatus(cmd, STATUS_ERROR);
             break;

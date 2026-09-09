@@ -3,10 +3,14 @@
 subg_scan.py - Sub-1GHz (915 MHz US ISM) channel scanner for KillerBee's
 CC1354P10 driver.
 
-Scans a configurable set of channels (default 1-10, the real firmware-
-tuned 906-924 MHz US ISM band - see firmware/src/kb-cc1354p10/README.md's
-"Sub-1GHz support" section for why this differs from kbutils.py's generic
-frequency() display), each for a configurable dwell time, and writes:
+Scans a configurable set of channels (default 0-9, the first 10 of the
+real 129-channel SUN O-QPSK Rate Mode 0 plan - 902.2 + 0.2*channel MHz,
+spanning 902.2-927.8 MHz. Verified directly against TI's own ti154stack
+(their real IEEE 802.15.4g/SUN protocol stack source, in the installed
+SDK) rather than assumed - see firmware/src/kb-cc1354p10/README.md's
+"Sub-1GHz support" section for the full story, including an earlier,
+wrong channel plan this project used before being corrected), each for a
+configurable dwell time, and writes:
 
   - one libpcap file per channel with any captured traffic
     (readable in Wireshark, or by killerbee/zbdump/zbconvert etc.)
@@ -17,11 +21,14 @@ Usage:
     python3 tools/subg_scan.py [options]
 
 Examples:
-    # Default: channels 1-10, 20s each, into ./subg_scan_<timestamp>/
+    # Default: channels 0-9, 20s each, into ./subg_scan_<timestamp>/
     python3 tools/subg_scan.py
 
-    # 60s dwell per channel, only channels 1, 5, 10
-    python3 tools/subg_scan.py -t 60 -c 1,5,10
+    # 60s dwell per channel, only channels 0, 64 (915.0 MHz exactly), 128
+    python3 tools/subg_scan.py -t 60 -c 0,64,128
+
+    # Full real channel plan (0-128, 129 channels - long at any real dwell)
+    python3 tools/subg_scan.py -c 0-128
 
     # Custom device and output directory
     python3 tools/subg_scan.py -i /dev/ttyACM0 -o /tmp/myscan
@@ -47,11 +54,13 @@ from scapy.layers.dot15d4 import Dot15d4Data, Dot15d4Beacon, Dot15d4Cmd  # type:
 
 from killerbee import KillerBee, KBCapabilities, PcapDumper, DLT_IEEE802_15_4  # type: ignore
 
-# Real firmware-tuned frequency for each channel (906 + 2*(ch-1) MHz) -
-# see firmware/src/kb-cc1354p10/main.c's rfTuneToChannel() comment. This is
-# NOT what kb.frequency() would print (a different, denser page-31 formula
+# Real SUN O-QPSK Rate Mode 0 channel plan for the 902-928 MHz US band:
+# 902.2 + 0.2*channel MHz, channels 0-128 - see
+# firmware/src/kb-cc1354p10/main.c's rfTuneToChannel() comment for the
+# TI ti154stack source verification behind these numbers. This is NOT
+# what kb.frequency() would print (a different, generic page-31 formula
 # from kbutils.py) - documented, deliberate divergence.
-FREQ_MHZ = {ch: 906 + 2 * (ch - 1) for ch in range(1, 11)}
+FREQ_MHZ = {ch: round(902.2 + 0.2 * ch, 1) for ch in range(0, 129)}
 
 FRAME_TYPE_NAMES = {0: "Beacon", 1: "Data", 2: "Ack", 3: "MAC Command"}
 
@@ -176,7 +185,7 @@ def format_report(channels: List[int], dwell: float,
         total_valid += len(valid)
 
         lines.append("")
-        lines.append("--- Channel %d (%d MHz) ---" % (ch, FREQ_MHZ[ch]))
+        lines.append("--- Channel %d (%.1f MHz) ---" % (ch, FREQ_MHZ[ch]))
         lines.append("  Packets captured: %d (%d with valid CRC)" % (len(pkts), len(valid)))
 
         if not pkts:
@@ -227,16 +236,17 @@ def main() -> None:
                      help="KillerBee hardware type (default: cc1354p10)")
     ap.add_argument("-t", "--dwell", type=float, default=20.0,
                      help="Seconds to listen per channel (default: 20)")
-    ap.add_argument("-c", "--channels", default="1-10",
-                     help="Channel spec, e.g. '1-10' or '1,3,5' (default: 1-10)")
+    ap.add_argument("-c", "--channels", default="0-9",
+                     help="Channel spec, e.g. '0-128' (full real plan) or '0,64,128' "
+                          "(default: 0-9)")
     ap.add_argument("-o", "--outdir", default=None,
                      help="Output directory (default: ./subg_scan_<timestamp>)")
     args = ap.parse_args()
 
     channels = parse_channels(args.channels)
     for ch in channels:
-        if ch < 1 or ch > 10:
-            print("error: channel %d out of range (valid: 1-10)" % ch, file=sys.stderr)
+        if ch < 0 or ch > 128:
+            print("error: channel %d out of range (valid: 0-128)" % ch, file=sys.stderr)
             sys.exit(1)
 
     outdir = args.outdir or ("subg_scan_%s" % datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
@@ -254,7 +264,7 @@ def main() -> None:
     try:
         for ch in channels:
             pcap_path = os.path.join(outdir, "ch%d.pcap" % ch)
-            print("=== Channel %d (%d MHz) - %.1fs ===" % (ch, FREQ_MHZ[ch], args.dwell))
+            print("=== Channel %d (%.1f MHz) - %.1fs ===" % (ch, FREQ_MHZ[ch], args.dwell))
             packets = scan_channel(kb, ch, args.dwell, pcap_path)
             results[ch] = packets
             scanned.append(ch)

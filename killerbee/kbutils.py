@@ -147,7 +147,14 @@ class KBCapabilities:
                 return False
             if page == 30 and (channel > 26 or not self.check(self.FREQ_870)):
                 return False
-            if page == 31 and (channel > 26 or not self.check(self.FREQ_915)):
+            if page == 31 and (channel > 128 or not self.check(self.FREQ_915)):
+                # Upper bound 128, not 26: the CC1354P10's real, verified
+                # SUN O-QPSK Rate Mode 0 channel plan has 129 channels
+                # (0-128, 902.2 + 0.2*channel MHz) - see
+                # firmware/src/kb-cc1354p10/main.c's rfTuneToChannel()
+                # comment. This is a generic first-pass filter; each
+                # device's own driver does the authoritative, tighter
+                # check for its actual hardware afterward regardless.
                 return False
             if page < 28 or page > 31:
                 return False

@@ -22,8 +22,11 @@ Wire protocol (921600 8N1):
   CMD_SET_CHANNEL  0x03  payload=[channel] or [channel][page]  -> reply [status]
                          page 0 = 2.4GHz (channel 11-26, default if page
                          omitted); page 31 = 915MHz US ISM SUN O-QPSK
-                         (channel 1-10) - switches the RF core's radio
-                         setup at runtime, see main.c's "stage 4" comment.
+                         Rate Mode 0 (channel 0-128, 902.2 + 0.2*channel
+                         MHz - the real standard channel plan, verified
+                         against TI's own ti154stack) - switches the RF
+                         core's radio setup at runtime, see main.c's
+                         "stage 4" comment.
   CMD_SNIFFER_ON   0x04  -> reply [status]
   CMD_SNIFFER_OFF  0x05  -> reply [status]
   CMD_INJECT       0x06  payload=[count][delay_ms lo][delay_ms hi][frame...]
@@ -105,9 +108,11 @@ class CC1354P10:
         self.capabilities.setcapab(KBCapabilities.FREQ_863, False)
         self.capabilities.setcapab(KBCapabilities.FREQ_868, False)
         self.capabilities.setcapab(KBCapabilities.FREQ_870, False)
-        # 915 MHz US ISM, channels 1-10, via a second on-chip radio setup
-        # (SUN O-QPSK Rate Mode 0) the firmware switches to at runtime - see
-        # firmware/src/kb-cc1354p10/main.c's "stage 4" header comment.
+        # 915 MHz US ISM, channels 0-128 (902.2 + 0.2*channel MHz - the
+        # real SUN O-QPSK Rate Mode 0 channel plan, verified against TI's
+        # own ti154stack), via a second on-chip radio setup the firmware
+        # switches to at runtime - see firmware/src/kb-cc1354p10/main.c's
+        # "stage 4" header comment.
         self.capabilities.setcapab(KBCapabilities.FREQ_915, True)
 
         self.capabilities.setcapab(KBCapabilities.SNIFF, True)
@@ -237,15 +242,17 @@ class CC1354P10:
                 raise Exception('Invalid channel')
         elif page == 31:
             self.capabilities.require(KBCapabilities.FREQ_915)
-            if channel < 1 or channel > 10:
-                raise Exception('Invalid channel (must be 1-10 for the 915 MHz US ISM band)')
+            if channel < 0 or channel > 128:
+                raise Exception('Invalid channel (must be 0-128 for the 915 MHz US ISM '
+                                 'band - the real SUN O-QPSK Rate Mode 0 channel plan, '
+                                 '902.2 + 0.2*channel MHz, verified against TI\'s own '
+                                 'ti154stack; see firmware/src/kb-cc1354p10/README.md)')
         else:
             raise Exception('Unsupported page %d - only 0 (2.4 GHz) and 31 (915 MHz) exist on this device' % page)
         status = self.__command(CMD_SET_CHANNEL, bytes([channel, page]))
         if status[0] != STATUS_OK:
             raise Exception("Device rejected channel %d (page %d)" % (channel, page))
         self._channel = channel
-        self._page = page
         self._page = page
 
     def inject(self, packet: bytes, channel: Optional[int] = None, count: int = 1,

@@ -28,7 +28,7 @@ It drives the RF core directly with raw `CMD_IEEE_RX` / `CMD_IEEE_TX` /
 promiscuous capture, arbitrary frame injection, and PHY-level jamming — the
 things a MAC-filtered "coprocessor" firmware would take away.
 
-As of stage 4, it also supports the 915 MHz US ISM band (channels 1-10)
+As of stage 4, it also supports the 915 MHz US ISM band (channels 0-128)
 via a second, runtime-switchable radio setup - see "Sub-1GHz support"
 below.
 
@@ -37,14 +37,14 @@ below.
 | KBCapabilities   | Supported | Notes |
 |------------------|-----------|-------|
 | SNIFF            | yes       | Promiscuous `CMD_IEEE_RX` (2.4GHz) / `CMD_PROP_RX` (915MHz), frame filtering off by default |
-| SETCHAN          | yes       | Channels 11-26 (2.4 GHz, page 0) and 1-10 (915 MHz, page 31) |
+| SETCHAN          | yes       | Channels 11-26 (2.4 GHz, page 0) and 0-128 (915 MHz, page 31) |
 | INJECT           | yes       | `CMD_IEEE_TX` (2.4GHz) / `CMD_PROP_TX` (915MHz), hardware auto-computes/appends the FCS |
 | SELFACK          | yes*      | Extra `driver.set_selfack()` method — see caveat below; no generic KillerBee-level setter exists in this codebase for any device. Both bands - hardware auto-ACK on 2.4GHz, software reflex on sub-1GHz (no hardware ACK support in `CMD_PROP_RX` - see "Sub-1GHz support") |
 | PHYJAM           | yes       | Continuous `CMD_TX_TEST` (modulated PRBS-15 garbage) - PHY-agnostic, works on either band |
 | PHYJAM_REFLEX    | yes*      | Best-effort software-loop reflex — see caveat below. Both bands - see "Sub-1GHz support" for the sub-1GHz-specific implementation notes |
 | SET_SYNC         | no        | The native IEEE 802.15.4 RX/TX commands use a fixed, standard O-QPSK preamble/SFD; there is no register here to reprogram it (unlike CC2420-style radios) |
 | FREQ_2400        | yes       | |
-| FREQ_915         | yes       | 915 MHz US ISM, channels 1-10 - see "Sub-1GHz support" below |
+| FREQ_915         | yes       | 915 MHz US ISM, channels 0-128 - see "Sub-1GHz support" below |
 | FREQ_900/863/868/870 | no    | Only 2.4 GHz and 915 MHz US ISM are configured in this firmware |
 | BOOT             | no        | No bootloader protocol exposed over this UART; reflash via the debug probe (see below) |
 
@@ -62,7 +62,7 @@ hook for this over the public radio command API. Short frames may finish
 before the jam lands; it is most effective against longer frames or ARQ
 retransmissions.
 
-## Sub-1GHz support (915 MHz US ISM, channels 1-10)
+## Sub-1GHz support (915 MHz US ISM, channels 0-128)
 
 A second radio setup - **SUN O-QPSK, Rate Mode 0** (6.25 kbps, 100 kchip/s;
 the mandatory/base rate per IEEE 802.15.4g, for broadest interoperability)
@@ -71,27 +71,63 @@ the mandatory/base rate per IEEE 802.15.4g, for broadest interoperability)
 Candidate"** (see `cc1354p10_prop_pg20/param_syscfg.json` in the SDK) - not
 a TI-validated production PHY, so treat capture quality/sensitivity with
 appropriate caution; this has only been validated for whether the plumbing
-works (no hangs, no crashes across a full 10-channel/20s-each scan), not
-for genuine over-the-air decode accuracy against a real 915 MHz SUN O-QPSK
-transmitter.
+works (no hangs, no crashes across a full scan), not for genuine
+over-the-air decode accuracy against a real 915 MHz SUN O-QPSK transmitter.
 
 `SET_CHANNEL`'s payload grew a second, optional byte for this: `[channel]`
 (legacy, always page 0) or `[channel][page]`, where page 0 = 2.4 GHz
-(channel 11-26, unchanged) and page 31 = 915 MHz (channel 1-10) - page 31
+(channel 11-26, unchanged) and page 31 = 915 MHz (channel 0-128) - page 31
 matches KillerBee's own `KBCapabilities.FREQ_915` page number.
 `GET_CHANNEL`'s reply grew to match: `[channel][page]`.
 
-**Channel-to-frequency mapping** for the 915 MHz band follows the classic
-IEEE 802.15.4-2006 US ISM band plan - channel *n* is `906 + 2*(n-1)` MHz
-(906, 908, ..., 924 MHz) - **not** KillerBee's own `kbutils.py`
-`frequency()` helper's page-31 formula, which uses a denser/different
-spacing more suited to a generic SUN-PHY channel plan. Channels 1-10 on
-the real, well-known standard channel numbering was the explicit target
-this was built for; `kb.frequency(channel, page=31)` (used by tools like
-`zbdump` to print a human-readable frequency banner) will report a
-different, **not accurate**, frequency for this device as a result - the
-mismatch is deliberate and documented, not an oversight, but worth knowing
-if a printed banner frequency looks off.
+**Channel-to-frequency mapping - corrected after initially shipping the
+wrong one.** The first version of this feature used the classic IEEE
+802.15.4-2006 O-QPSK channel plan (channel *n* = `906 + 2*(n-1)` MHz,
+channels 1-10) - a real, standard channel plan, just for the **wrong PHY**.
+This firmware runs SUN O-QPSK (IEEE 802.15.4g, folded into
+802.15.4-2015/2020), which defines its own, different channel plan for the
+902-928 MHz US band. Caught via user review, not internal testing - a fair
+correction, and worth being explicit that the earlier plan was simply
+wrong, not a simplification.
+
+Verified this time directly against TI's own source, not assumed: the
+installed SDK ships `ti154stack`, TI's actual IEEE 802.15.4g/SUN protocol
+stack implementation, and its `high_level/mac_pib.h` hard-codes the real
+values for this exact rate mode (TI calls it "5KBPS_915MHZ", the same one
+SysConfig's radioconfig tool calls `qpsk6kbpsrm0`/Rate Mode 0):
+
+```
+MAC_5KBPS_915MHZ_BAND_MODE_1_CENTER_FREQ_KHZ  = 902200   (902.2 MHz)
+MAC_5KBPS_915MHZ_BAND_MODE_1_CHAN_SPACING_KHZ = 200      (0.2 MHz)
+MAC_5KBPS_915MHZ_BAND_MODE_1_TOTAL_CHANNELS   = 129      (channels 0-128)
+```
+
+So: **channel *n* (0-128) = `902.2 + 0.2*n` MHz**, spanning 902.2-927.8 MHz
+- 129 real, standard channel numbers a genuine SUN/802.15.4g device would
+actually use (channel 64 lands on exactly 915.0 MHz, a handy sanity check).
+Sub-MHz precision needs `CMD_FS`'s `fractFreq` field (a 16-bit fraction of
+1 MHz: actual tuned frequency = `frequency + fractFreq/65536` MHz) rather
+than the plain integer-MHz `frequency` field alone, which is all the
+earlier, wrong 2 MHz-spaced plan ever needed - verified against TI's own
+SysConfig radioconfig code generator
+(`ti/devices/radioconfig/.meta/cmd_handler.js`), including replicating its
+rounding to the synth's native ~51.2 step size for full fidelity.
+
+This still does **not** match KillerBee's own `kbutils.py` `frequency()`
+helper's page-31 formula, which uses yet another, different, generic
+spacing not specific to this PHY - `kb.frequency(channel, page=31)` (used
+by tools like `zbdump` to print a human-readable frequency banner) will
+still report an inaccurate frequency for this device. That divergence is
+still deliberate and documented, unlike the channel-plan bug above, which
+was a real, corrected mistake.
+
+The generic cross-device `KBCapabilities.is_valid_channel()` check in
+`killerbee/kbutils.py` also needed updating - its page-31 case had a
+hard-coded `channel > 26` upper bound (fine for the old, wrong 1-10 plan,
+but it silently rejected valid channels once the real 0-128 range was
+implemented). Raised to `channel > 128`; each device's own driver still
+does the authoritative, tighter check for its actual hardware regardless,
+so this is a defense-in-depth first-pass filter, not the sole gate.
 
 **Switching bands is a real, deliberate risk, not a free operation.**
 Unlike the 2.4 GHz-only channel changes, switching *between* page 0 and
@@ -453,7 +489,7 @@ Device -> Host:  [0xA5][CMD|0x80] [LEN][LEN bytes payload]   (reply to CMD)
 |------|------------------|------------------------------------------------|---------------|
 | 0x01 | PING             | —                                                | ASCII firmware ID, e.g. `KB-CC1354P10 v1.0` |
 | 0x02 | GET_CHANNEL      | —                                                | `[channel][page]` |
-| 0x03 | SET_CHANNEL      | `[channel]` or `[channel][page]` (page 0: 11-26, page 31: 1-10) | `[status]` |
+| 0x03 | SET_CHANNEL      | `[channel]` or `[channel][page]` (page 0: 11-26, page 31: 0-128) | `[status]` |
 | 0x04 | SNIFFER_ON       | —                                                | `[status]` |
 | 0x05 | SNIFFER_OFF      | —                                                | `[status]` |
 | 0x06 | INJECT           | `[count][delay_ms lo][delay_ms hi][frame...]`   | `[status]` |
@@ -531,8 +567,8 @@ kb.driver.set_selfack(True)       # extra, non-standard KillerBee method
 kb.jammer_on(method="reflexive")  # or method=None / "constant"
 kb.jammer_off()
 
-# 915 MHz US ISM band (page 31, channels 1-10) - see "Sub-1GHz support"
-kb.set_channel(1, page=31)
+# 915 MHz US ISM band (page 31, channels 0-128) - see "Sub-1GHz support"
+kb.set_channel(64, page=31)  # 902.2 + 0.2*64 = 915.0 MHz exactly
 kb.sniffer_on()
 pkt = kb.pnext(timeout=2)
 kb.set_channel(15)  # page defaults back to 0 (2.4 GHz)
