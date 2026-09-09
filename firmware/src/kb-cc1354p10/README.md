@@ -192,28 +192,76 @@ firmware can fix.
     that thread is reading the `RFCPEIFG` register
     (`RFC_DBELL_BASE + 0x10` = `0x40041010` on this device, per
     `hw_rfc_dbell.h`) to see the CPE's exact state during a hang.
-  - Tried to actually do that read live during a reproduced hang, without
-    resetting the board first (so as not to destroy the very state being
-    inspected). Could not: any DSLite connection to the target runs this
-    board's configured GEL startup script, which performs a board reset as
-    part of establishing the debug connection - there's no way with the
-    DSLite CLI used throughout this project to attach and read a register
-    without also resetting the chip first. A live, held-open, no-reset-on-
-    attach debug session (e.g. through CCS or a GDB/OpenOCD setup against
-    the XDS110) would be needed to actually read `RFCPEIFG` mid-hang. That
-    wasn't available in this environment.
+  - Initially concluded that reading `RFCPEIFG` live during a hang was
+    impossible, because any DSLite connection runs the target's GEL startup
+    script, which resets the board on attach. Found a real way around this
+    instead of giving up: the GEL script's own comment says the reset is
+    gated by `if(!GEL_IsConnected())`, with an explicit note on how to skip
+    it. Built a self-contained, scratchpad-only mirror of the relevant
+    TI device-config/GEL files (symlinked back to the shared SDK install
+    for everything *except* the one modified file, so nothing outside the
+    project was touched) with that reset disabled, and used it to connect
+    without resetting the target.
+  - This actually worked and produced a real, surprising result: **a bare
+    JTAG connect with no reset reliably restored UART communication after
+    a reproduced hang**, when 15-40+ seconds of passive polling alone never
+    did. ARM core fault registers (`CFSR`, `HFSR` at `0xE000ED28`/`0xE000ED2C`)
+    read as `0` and `ICSR`'s `VECTACTIVE` field showed `0` (normal thread
+    mode) during the hang - so the M33 core was not in any fault handler.
+  - Reading `RFCPEIFG` itself (`0x40041010`) failed with a driver-level
+    "Invalid parameter" error both during the hang and, it turned out,
+    also just failed outright as a read target regardless of device state.
+    A companion read of the RFC power-domain status bit (`PRCM.PDSTAT1`,
+    `0x58082194`) showed the RF core reporting powered off during the hang
+    - which looked like a strong lead (RF domain collapsing mid-transmit)
+    and briefly drove the belief that the RTOS's default standby policy
+    was letting the chip sleep while sub-1GHz TX was still logically
+    active. Added a permanent `Power_setConstraint(PowerCC26XX_SB_DISALLOW)`
+    + `PowerCC26XX_IDLE_PD_DISALLOW` at boot to rule this out - a real fix
+    if it were the cause, and validated against TI's own reference: the
+    installed SDK's `examples/rtos/LP_EM_CC1354P10_1/prop_rf/rfCarrierWave/
+    tirtos7/main_tirtos.c` sets exactly these two constraints (gated behind
+    a different board's config flag). **Tested directly and it did not
+    help** - the identical jammer-on-then-`GET_CHANNEL` hang reproduced
+    instantly, unchanged. The constraints are harmless (this board is
+    always tethered, never battery-powered) and are kept as a reasonable
+    default, but they are not the fix.
+  - Went further to check whether the `RFC_ON=0` / `RFCPEIFG` read failure
+    actually meant anything, rather than trusting it. Built and flashed
+    TI's own **unmodified** `rfCarrierWave` example (from the SDK's
+    `examples/rtos/LP_EM_CC1354P10_1/prop_rf/rfCarrierWave`, zero of this
+    project's code involved) and took the same live register readings
+    while it was running and, per its own design, continuously
+    transmitting. **The exact same readings came back** - `RFCPEIFG`
+    "Invalid parameter" and `RFC_ON=0` - on TI's own reference firmware,
+    running normally. This means those specific readings are not a
+    reliable signal of anything broken; they most likely reflect a
+    limitation of reading power-domain-gated peripheral registers through
+    a bare DSLite memory read (rather than a live, halted debug session
+    with correct power-domain sequencing), not a genuine RF-core fault.
+    **That theory and the `RFC_ON=0` evidence behind it are retracted.**
+    The CPU fault-register findings (no fault, thread mode) are unaffected
+    by this correction, since those are always-on core-debug registers,
+    not power-domain-gated peripheral ones - so that part of the picture
+    still stands.
 
   **Honest bottom line:** the sub-1GHz radio path on this chip has a real,
-  TI-acknowledged reliability limitation under sustained TX activity that
-  this project could not fully root-cause or fix with the tools and access
-  available - not for lack of trying. `RF_yield()` is a genuine, worthwhile
-  improvement and is kept. Treat any sustained sub-1GHz TX activity
-  (constant jam, or several back-to-back inject packets) as something that
-  can still end the session and require the JTAG UART-resync step above to
-  recover. A real fix, if one exists, most likely needs either TI's direct
-  engineering support, a non-"Release Candidate" PHY preset if TI ships
-  one for this device in the future, or genuine register/PC-level JTAG
-  debugging tooling this project doesn't currently have set up.
+  reproducible reliability limitation under sustained TX activity, and a
+  real, TI-acknowledged forum report of the same failure class exists for
+  this exact chip - so this isn't specific to this project's firmware.
+  Root cause is still not identified. Two genuine improvements were made
+  and kept (`RF_yield()`, permanent standby/idle disallow) because they're
+  correct per TI's own reference code, but neither fixed the underlying
+  issue, and one promising lead (RF power domain collapsing) turned out to
+  be a misread diagnostic, caught and retracted by cross-checking against
+  TI's own unmodified reference firmware rather than left standing.
+  Treat any sustained sub-1GHz TX activity (constant jam, or several
+  back-to-back inject packets) as something that can still end the session
+  and require the JTAG UART-resync step above to recover. A real fix, if
+  one exists, most likely needs TI's direct engineering support or a live,
+  halted JTAG/GDB debug session capable of correctly sequencing
+  power-domain access to peripheral registers - neither of which this
+  project has available.
 
 ## Wire protocol
 

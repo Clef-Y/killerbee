@@ -54,6 +54,8 @@
 #include <ti/drivers/UART2.h>
 #include <ti/drivers/GPIO.h>
 #include <ti/drivers/rf/RF.h>
+#include <ti/drivers/Power.h>
+#include <ti/drivers/power/PowerCC26XX.h>
 
 #include <ti/devices/DeviceFamily.h>
 #include DeviceFamily_constructPath(driverlib/rf_mailbox.h)
@@ -935,6 +937,29 @@ void *mainThread(void *arg0)
             usleep(500000);
         }
     }
+
+    /* Permanently disallow standby/idle power-down for this firmware's
+     * entire lifetime. This board is always USB/debug-probe-tethered for
+     * this tool's use case (never battery-powered), so there is no real
+     * downside to giving up power savings entirely - in exchange for
+     * ruling out an entire class of RF-core reliability bugs found via
+     * hardware testing: the sub-1GHz (LO-divider) radio path was observed
+     * to freeze solid (RFC power domain reporting OFF mid-transmission,
+     * UART dead, no self-recovery even after 40s - but reliably cleared
+     * by a bare JTAG debug-probe attach, which is consistent with the
+     * chip having dropped into standby while RF activity was still
+     * logically active rather than a genuine CPU lockup) during sustained
+     * sub-1GHz TX activity (constant-carrier jamming, 3+ back-to-back
+     * transmissions). TI's own reference project template
+     * (examples/rtos/LP_EM_CC1354P10_1/prop_rf/rfCarrierWave/tirtos7/
+     * main_tirtos.c) sets exactly these two constraints - gated behind a
+     * different board's config flag (CONFIG_LP_CC2674R10_FPGA) rather than
+     * applied generally - confirming this is a real, TI-acknowledged
+     * necessity for continuous prop-RF activity on this chip family, not
+     * a guess. The default idle policy (PowerCC26XX_standbyPolicy, see
+     * ti_drivers_config.c) is what these constraints block. */
+    Power_setConstraint(PowerCC26XX_SB_DISALLOW);
+    Power_setConstraint(PowerCC26XX_IDLE_PD_DISALLOW);
 
     pthread_t fwdThread;
     pthread_attr_t attrs;
