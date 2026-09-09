@@ -148,12 +148,13 @@ def main() -> None:
               file=sys.stderr)
         sys.exit(1)
 
-    # Measured on real hardware: ~32ms per set_channel() round trip while
-    # sniffing (SET_CHANNEL retunes the already-running CMD_PROP_RX in one
-    # UART round trip - see this file's header comment). Included here so
-    # the printed cycle estimate matches reality, not just the configured
-    # listen dwell.
-    HOP_OVERHEAD_S = 0.032
+    # Set equal to the per-channel dwell (--sweep-dwell) at the user's
+    # request, rather than the ~32ms actually measured for a set_channel()
+    # round trip while sniffing (SET_CHANNEL retunes the already-running
+    # CMD_PROP_RX in one UART round trip - see this file's header comment).
+    # This only affects the printed cycle-time estimate below, not actual
+    # sweep timing/behavior.
+    HOP_OVERHEAD_S = args.sweep_dwell
     print("Sweeping %d channels (%s), %.2fs dwell each -> ~%.1fs per full sweep cycle "
           "(measured ~%dms/hop overhead included)"
           % (len(channels), args.channels, args.sweep_dwell,

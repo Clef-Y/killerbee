@@ -174,7 +174,7 @@ def scan_channel(kb: KillerBee, ch: int, dwell: float, pcap_path: str,
                 else:
                     if rssi is not None:
                         rssi_samples.append({
-                            "timestamp": datetime.datetime.utcnow().isoformat(),
+                            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                             "rssi_dbm": rssi,
                         })
                 next_rssi_sample = time.time() + rssi_interval
