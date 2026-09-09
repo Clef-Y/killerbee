@@ -34,6 +34,13 @@ Wire protocol (921600 8N1):
   CMD_JAMMER_OFF   0x08
   CMD_SET_SELFACK  0x09  payload=[enable]
   CMD_RESET        0x0A
+  CMD_GET_RSSI     0x0B  -> reply payload = [rssi int8]
+                         Ambient channel energy via TI's RF_getRssi(), a
+                         single direct/immediate RF-core call - no new
+                         RF_postCmd, no state change. REQUIRES an active
+                         RX operation (i.e. SNIFFER_ON already sent) or it
+                         returns TI's own documented error sentinel,
+                         RF_GET_RSSI_ERROR_VAL = -128 (see RFCC26X2.h).
 
   Async packet (CMD 0x90) payload:
       [rssi int8][crc_ok uint8][timestamp uint32 LE][framelen uint8][frame...]
@@ -66,6 +73,9 @@ CMD_JAMMER_ON: int = 0x07
 CMD_JAMMER_OFF: int = 0x08
 CMD_SET_SELFACK: int = 0x09
 CMD_RESET: int = 0x0A
+CMD_GET_RSSI: int = 0x0B
+
+RF_GET_RSSI_ERROR_VAL: int = -128
 
 CMD_REPLY_BIT: int = 0x80
 CMD_ASYNC_PACKET: int = 0x90
@@ -375,3 +385,23 @@ class CC1354P10:
     def reset(self) -> None:
         '''Resets the firmware's RF/channel/self-ack state to defaults.'''
         self.__command(CMD_RESET)
+
+    def get_rssi(self) -> Optional[int]:
+        '''
+        Samples ambient RF energy on the current channel via TI's
+        RF_getRssi(), independent of packet capture - i.e. this reports a
+        real reading even on a channel with zero traffic.
+
+        REQUIRES sniffer_on() to already be active (an RX operation must be
+        running on the RF core for the radio to have a live RSSI value).
+        Returns None if no RX operation is running, mirroring TI's own
+        RF_GET_RSSI_ERROR_VAL sentinel (see RFCC26X2.h) rather than
+        returning the raw, misleading -128.
+        '''
+        payload = self.__command(CMD_GET_RSSI)
+        if len(payload) < 1:
+            raise Exception("Malformed GET_RSSI reply")
+        rssi = struct.unpack('b', payload[0:1])[0]
+        if rssi == RF_GET_RSSI_ERROR_VAL:
+            return None
+        return rssi

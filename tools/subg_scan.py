@@ -16,7 +16,10 @@ configurable dwell time, and writes:
     channels with zero activity are left out entirely, not written as an
     empty header-only file (readable in Wireshark, or by
     killerbee/zbdump/zbconvert etc.)
-  - a detailed per-channel + summary text report
+  - a detailed per-channel + summary text report, including ambient RSSI
+    (direct RF-core energy sampling via a firmware CMD_GET_RSSI command,
+    independent of packet capture) for every channel, even ones with zero
+    decoded packets - see --rssi-interval/--no-rssi
   - a JSON file with the full structured results, for scripted reuse
 
 Usage:
@@ -125,20 +128,35 @@ def decode_frame(raw: bytes) -> Dict[str, Any]:
 
 
 def scan_channel(kb: KillerBee, ch: int, dwell: float, pcap_path: str,
-                  poll: float = 0.5) -> List[Dict[str, Any]]:
+                  poll: float = 0.5, rssi_interval: float = 1.0,
+                  sample_rssi: bool = True
+                  ) -> "tuple[List[Dict[str, Any]], List[Dict[str, Any]]]":
     """Listens on channel ch for dwell seconds. The pcap file at pcap_path
     is only created on the *first* captured packet (lazy open) - a
     channel with zero activity leaves no pcap file behind at all, rather
     than a 24-byte empty-header file. Every prior scan on this project has
     turned up mostly-empty channels; this keeps output directories to
     just the channels that actually had something, instead of dozens of
-    files that are only ever libpcap headers with nothing in them."""
+    files that are only ever libpcap headers with nothing in them.
+
+    Also samples ambient channel energy (regardless of packet activity)
+    roughly every rssi_interval seconds via kb.driver.get_rssi() - TI's
+    RF_getRssi(), a direct RF-core read, not derived from captured
+    packets. This is the only way to tell a genuinely quiet channel from
+    one with real RF energy but no decodable 802.15.4 traffic. If the
+    connected firmware doesn't support it (older firmware, no
+    CMD_GET_RSSI), sample_rssi is expected to already be False - see
+    main()'s startup probe.
+
+    Returns (packets, rssi_samples)."""
     kb.set_channel(ch, page=31)
     kb.sniffer_on()
 
     dumper: Optional[PcapDumper] = None
     packets: List[Dict[str, Any]] = []
+    rssi_samples: List[Dict[str, Any]] = []
     t_end = time.time() + dwell
+    next_rssi_sample = time.time()
 
     try:
         while time.time() < t_end:
@@ -147,6 +165,20 @@ def scan_channel(kb: KillerBee, ch: int, dwell: float, pcap_path: str,
                 pkt = kb.pnext(timeout=min(poll, remaining) if remaining > 0 else poll)
             except SerialException:
                 break
+
+            if sample_rssi and time.time() >= next_rssi_sample:
+                try:
+                    rssi = kb.driver.get_rssi()
+                except Exception:
+                    sample_rssi = False
+                else:
+                    if rssi is not None:
+                        rssi_samples.append({
+                            "timestamp": datetime.datetime.utcnow().isoformat(),
+                            "rssi_dbm": rssi,
+                        })
+                next_rssi_sample = time.time() + rssi_interval
+
             if pkt is None:
                 continue
 
@@ -171,11 +203,23 @@ def scan_channel(kb: KillerBee, ch: int, dwell: float, pcap_path: str,
             dumper.close()
         kb.sniffer_off()
 
-    return packets
+    return packets, rssi_samples
+
+
+def rssi_stats(samples: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    vals = [s["rssi_dbm"] for s in samples]
+    if not vals:
+        return None
+    return {
+        "min": min(vals),
+        "max": max(vals),
+        "avg": sum(vals) / len(vals),
+        "count": len(vals),
+    }
 
 
 def format_report(channels: List[int], dwell: float,
-                   results: Dict[int, List[Dict[str, Any]]],
+                   results: Dict[int, Dict[str, Any]],
                    outdir: str) -> str:
     lines = []
     lines.append("=" * 72)
@@ -190,29 +234,44 @@ def format_report(channels: List[int], dwell: float,
     total_valid = 0
     all_addrs = set()
     active_channels = 0
+    quiet_lines = []
 
     for ch in channels:
-        pkts = results.get(ch, [])
+        chan = results.get(ch, {})
+        pkts = chan.get("packets", [])
+        samples = chan.get("rssi_samples", [])
         valid = [p for p in pkts if p["crc_ok"]]
         total_packets += len(pkts)
         total_valid += len(valid)
+        stats = rssi_stats(samples)
 
         if not pkts:
-            # No activity on this channel - skip it entirely rather than
-            # print an empty section. With mostly-quiet channels being the
-            # norm on this band (see this session's scan history), a
-            # per-channel "No activity" block for every silent channel
-            # just buries the channels that actually had something.
+            # No packet activity on this channel. Rather than a verbose
+            # per-channel "No activity" block, show one compact line with
+            # the ambient RSSI reading (direct RF-core energy sample, not
+            # derived from packets - see scan_channel()'s get_rssi() use)
+            # so a channel with real RF energy but no decodable 802.15.4
+            # traffic is still distinguishable from a truly dead one. If
+            # ambient sampling is unavailable, skip the channel entirely,
+            # same as before.
+            if stats:
+                quiet_lines.append(
+                    "  ch %3d (%6.1f MHz): ambient min=%4d avg=%6.1f max=%4d dBm, no packets"
+                    % (ch, FREQ_MHZ[ch], stats["min"], stats["avg"], stats["max"])
+                )
             continue
 
         active_channels += 1
         lines.append("")
         lines.append("--- Channel %d (%.1f MHz) ---" % (ch, FREQ_MHZ[ch]))
         lines.append("  Packets captured: %d (%d with valid CRC)" % (len(pkts), len(valid)))
+        if stats:
+            lines.append("  Ambient RSSI: min=%d avg=%.1f max=%d dBm (%d samples)"
+                          % (stats["min"], stats["avg"], stats["max"], stats["count"]))
 
         rssis = [p["rssi_dbm"] for p in pkts if p["rssi_dbm"] is not None]
         if rssis:
-            lines.append("  RSSI range: %d to %d dBm" % (min(rssis), max(rssis)))
+            lines.append("  Packet RSSI range: %d to %d dBm" % (min(rssis), max(rssis)))
 
         for p in pkts:
             addr_bits = []
@@ -233,14 +292,19 @@ def format_report(channels: List[int], dwell: float,
             if p.get("decode_error"):
                 lines.append("      (decode error: %s)" % p["decode_error"])
 
-    if active_channels == 0:
+    if quiet_lines:
+        lines.append("")
+        lines.append("--- Silent channels (ambient RSSI only, no packets) ---")
+        lines.extend(quiet_lines)
+
+    if active_channels == 0 and not quiet_lines:
         lines.append("")
         lines.append("No activity on any of the %d channel(s) scanned." % len(channels))
 
     lines.append("")
     lines.append("=" * 72)
     lines.append("Summary: %d packets total (%d valid CRC) - %d of %d channel(s) "
-                  "had any activity"
+                  "had any packet activity"
                   % (total_packets, total_valid, active_channels, len(channels)))
     if all_addrs:
         lines.append("Unique addresses seen: %s" % ", ".join(sorted(all_addrs)))
@@ -264,6 +328,10 @@ def main() -> None:
                           "(default: 0-9)")
     ap.add_argument("-o", "--outdir", default=None,
                      help="Output directory (default: ./subg_scan_<timestamp>)")
+    ap.add_argument("--rssi-interval", type=float, default=1.0,
+                     help="Seconds between ambient RSSI samples per channel (default: 1.0)")
+    ap.add_argument("--no-rssi", action="store_true",
+                     help="Disable ambient RSSI sampling (packet capture only)")
     args = ap.parse_args()
 
     channels = parse_channels(args.channels)
@@ -281,22 +349,36 @@ def main() -> None:
               file=sys.stderr)
         sys.exit(1)
 
-    results: Dict[int, List[Dict[str, Any]]] = {}
+    sample_rssi = not args.no_rssi
+    if sample_rssi:
+        try:
+            kb.driver.get_rssi()
+        except Exception as e:
+            sample_rssi = False
+            print("note: ambient RSSI sampling unavailable (%s) - continuing "
+                  "without it (requires firmware with CMD_GET_RSSI support)" % e)
+
+    results: Dict[int, Dict[str, Any]] = {}
     scanned: List[int] = []
 
     try:
         for ch in channels:
             pcap_path = os.path.join(outdir, "ch%d.pcap" % ch)
             print("=== Channel %d (%.1f MHz) - %.1fs ===" % (ch, FREQ_MHZ[ch], args.dwell))
-            packets = scan_channel(kb, ch, args.dwell, pcap_path)
-            results[ch] = packets
+            packets, rssi_samples = scan_channel(kb, ch, args.dwell, pcap_path,
+                                                  rssi_interval=args.rssi_interval,
+                                                  sample_rssi=sample_rssi)
+            results[ch] = {"packets": packets, "rssi_samples": rssi_samples}
             scanned.append(ch)
             valid = sum(1 for p in packets if p["crc_ok"])
+            stats = rssi_stats(rssi_samples)
+            rssi_str = (" | ambient min=%d avg=%.1f max=%d dBm" %
+                        (stats["min"], stats["avg"], stats["max"])) if stats else ""
             if packets:
-                print("  %d packet(s) captured (%d valid CRC) -> %s"
-                      % (len(packets), valid, pcap_path))
+                print("  %d packet(s) captured (%d valid CRC) -> %s%s"
+                      % (len(packets), valid, pcap_path, rssi_str))
             else:
-                print("  0 packets captured - no pcap written")
+                print("  0 packets captured - no pcap written%s" % rssi_str)
     except KeyboardInterrupt:
         print("\nInterrupted - writing report for the %d channel(s) completed so far."
               % len(scanned))
@@ -322,7 +404,7 @@ def main() -> None:
             "results": results,
         }, f, indent=2, default=str)
 
-    pcap_count = sum(1 for ch in scanned if results.get(ch))
+    pcap_count = sum(1 for ch in scanned if results.get(ch, {}).get("packets"))
     print("\nWrote %s and %s (plus %d .pcap file(s), one per channel with "
           "activity) in %s"
           % (os.path.basename(report_path), os.path.basename(json_path),

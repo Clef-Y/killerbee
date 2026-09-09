@@ -98,6 +98,7 @@
 #define KB_CMD_JAMMER_OFF      0x08
 #define KB_CMD_SET_SELFACK     0x09
 #define KB_CMD_RESET           0x0A
+#define KB_CMD_GET_RSSI        0x0B
 
 #define CMD_REPLY_BIT       0x80
 #define CMD_ASYNC_PACKET    0x90
@@ -1096,6 +1097,24 @@ static void handleCommand(uint8_t cmd, const uint8_t *payload, uint8_t len)
             sendStatus(cmd, STATUS_ERROR);
         }
         break;
+
+    case KB_CMD_GET_RSSI: {
+        /* Deliberately minimal and low-risk: a single direct/immediate
+         * TI driver call (RF_getRssi() -> CMD_GET_RSSI), no new RF_postCmd
+         * of our own, no state changes. Per TI's driver
+         * (ti/drivers/rf/RFCC26X2_multiMode.c's RF_getRssi() and its
+         * header doc), this only returns a real reading while some RX
+         * operation is actively running on the RF core - the caller is
+         * expected to already have SNIFFER_ON active (any band); if not,
+         * or if the read genuinely fails, RF_getRssi() returns its own
+         * documented sentinel RF_GET_RSSI_ERROR_VAL (-128, a value real
+         * readings on this hardware essentially never hit), which is
+         * passed straight through rather than guessed at or hidden. */
+        int8_t rssi = RF_getRssi(rfHandle);
+        uint8_t reply[1] = { (uint8_t)rssi };
+        sendReply(cmd, reply, sizeof(reply));
+        break;
+    }
 
     default:
         /* Unknown command: no reply, just resync on the next SOF. */

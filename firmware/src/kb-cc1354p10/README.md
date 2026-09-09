@@ -192,6 +192,29 @@ implementations, not just capability flags left on:
   mechanism as sound and the frame format as correct per the 802.15.4
   spec, but genuinely unverified end-to-end, same caveat as the PHY
   preset's decode accuracy elsewhere in this document.
+- **Ambient RSSI** (`GET_RSSI` / `driver.get_rssi()`): direct RF-core
+  energy sampling via TI's `RF_getRssi()` API
+  (`RFCC26X2_multiMode.c`) - a single `RF_runDirectImmediateCmd()` call
+  (`CMDR_DIR_CMD(CMD_GET_RSSI)`), decoding bits `[23:16]` of the raw
+  status as a signed dBm value. Deliberately minimal by design: no new
+  `RF_postCmd`, no state changes - it only reads a live value off
+  whatever RX operation (plain sniff or the self-ACK thread's `CMD_PROP_RX`)
+  is already running, reusing the extensively-tested continuous RX path
+  rather than adding new RF command posting logic, consistent with this
+  firmware's general bias toward minimal new RF operations given the
+  brown-out history documented below. Requires `SNIFFER_ON` (or self-ACK)
+  to already be active; with no RX operation running it returns TI's own
+  documented error sentinel, `RF_GET_RSSI_ERROR_VAL = -128` (see
+  `RFCC26X2.h`) - `driver.get_rssi()` maps this to `None` rather than
+  passing the raw, misleading -128 through. Unlike per-packet RSSI (only
+  available when something is actually captured), this reports real
+  channel energy even on a channel with zero decodable 802.15.4 traffic -
+  used by `tools/subg_scan.py` to distinguish a genuinely quiet channel
+  from one with real RF energy but no decodable packets. Tested
+  repeatedly on real hardware: correct `-128` with no RX active, and
+  stable, physically plausible ambient readings (~-109 to -120 dBm, the
+  expected noise floor) across dozens of consecutive calls while
+  `SNIFFER_ON`, no hangs or instability.
 
 **The sub-1GHz PHY was meaningfully less reliable than 2.4GHz under
 sustained use, traced to a real hardware brown-out reset and now
@@ -497,6 +520,7 @@ Device -> Host:  [0xA5][CMD|0x80] [LEN][LEN bytes payload]   (reply to CMD)
 | 0x08 | JAMMER_OFF       | —                                                | `[status]` |
 | 0x09 | SET_SELFACK      | `[enable]`                                      | `[status]` |
 | 0x0A | RESET            | —                                                | `[status]` |
+| 0x0B | GET_RSSI         | —                                                | `[rssi int8]` |
 | 0x90 | (async) PACKET   | n/a — device-initiated                          | `[rssi int8][crc_ok u8][timestamp u32 LE][framelen u8][frame...]` |
 
 `status`: `0x00` = OK, `0x01` = ERROR. `frame` is the PSDU including the
