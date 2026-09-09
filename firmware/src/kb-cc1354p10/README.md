@@ -162,7 +162,9 @@ implementations, not just capability flags left on:
   band-aware append-byte parsing (already needed for plain sniffing) just
   works here too, no changes needed. Tested: 10+ seconds of sustained
   reflexive jamming, clean start and stop, no reboot needed on stop
-  (unlike constant-carrier jamming - see below).
+  (constant-carrier jamming's stop path used to force a reboot too - see
+  the brown-out writeup below for that whole story, including the later
+  fix that removed it).
 - **Self-ACK** (`SET_SELFACK` / `driver.set_selfack()`): a genuine hardware
   limitation, not a gap - `CMD_PROP_RX`/`CMD_PROP_RX_ADV` (checked in
   `rf_prop_cmd.h`) have no auto-ACK field anywhere, unlike `CMD_IEEE_RX`'s
@@ -249,11 +251,14 @@ working fix (reduced sub-1GHz TX power) that followed from the diagnosis.
   seeing no self-recovery.** No software timeout (a watchdog thread
   included - an earlier version of this fix tried exactly that and was
   dead code, since a timer interrupt can't fire while all interrupts are
-  masked) can recover from this once entered. The only real fix is to
+  masked) can recover from this once entered. The fix at the time was to
   never call `RF_cancelCmd()` for the specific case proven to trigger it:
-  `stopJammer()` now calls `SysCtrlSystemReset()` directly instead of
+  `stopJammer()` called `SysCtrlSystemReset()` directly instead of
   `rfJamStop()` when stopping constant-carrier jamming on `BAND_SUBG`,
-  skipping the hazardous call entirely.
+  skipping the hazardous call entirely. **Superseded below** once the
+  actual brown-out root cause was found and fixed - see "Follow-up fix"
+  further down, which restores the normal `rfJamStop()` path since the
+  condition that made it hazardous is gone.
 - **Not fixed - a sub-1GHz radio-path reliability limit, investigated in
   depth but not resolved:** further testing after the above fix found that
   UART communication actually breaks **as soon as sub-1GHz constant-carrier
@@ -475,20 +480,38 @@ working fix (reduced sub-1GHz TX power) that followed from the diagnosis.
     delivery is a genuine open tradeoff this project doesn't have enough
     data to resolve, and the TX-power fix already worked - no need to
     speculatively change a setting TI already recommends.
-  - **Not fully solved, just mitigated:** stopping the sub-1GHz constant
-    jammer still deliberately triggers `SysCtrlSystemReset()` (the
-    `stopJammer()` fix from earlier in this investigation, avoiding the
-    proven-hazardous `RF_cancelCmd()` path) and still needs the JTAG
-    UART-resync step afterward - that part of the design is unchanged and
-    intentional, not a regression. And this is still a power-delivery
-    mitigation, not a fix to the board's actual power delivery: 0 dBm was
-    chosen as a conservative, clearly-safe-margin starting point, not
-    precisely tuned to the actual brown-out threshold - it's plausible a
-    higher power (e.g. 5-10 dBm) would also be safe on this specific board,
-    were someone to characterize the actual margin (e.g. with a bench
-    supply and a scope on the rail, per the suggested next steps above).
-    Sub-1GHz range/link budget is correspondingly reduced from the
-    preset's original default.
+  - **Follow-up fix: stopping the sub-1GHz constant jammer no longer forces
+    a reboot.** For a while after the TX-power fix above, `stopJammer()`
+    still deliberately triggered `SysCtrlSystemReset()` for sub-1GHz
+    constant-carrier jamming rather than risk `RF_cancelCmd()`'s
+    `RFCDoorbellSendTo()` spin (see that function's comment) - a leftover
+    of defense-in-depth caution, not a retested requirement. Revisited and
+    fixed: since the brown-out (the RF core dying mid-command, unable to
+    ack an abort) was the actual reason that spin was ever a risk, and the
+    brown-out is now gone, the normal cancel-based stop was retested and
+    found safe. Verified live, repeatedly: `JAMMER_ON(constant)` on
+    sub-1GHz -> `JAMMER_OFF` -> `PING`, all clean, no reboot; and a full
+    `SET_CHANNEL` rotation across 6 channels *while jamming stayed active*
+    (`JAMMER_ON` once, then repeated `SET_CHANNEL` calls - the existing
+    `KB_CMD_SET_CHANNEL` handler already stops/retunes/resumes whatever
+    jam mode was running around a channel change, see its comment) - no
+    hangs, no reboots, jamming followed every hop. This also fixed a
+    latent double-reply protocol bug: the old `KB_CMD_JAMMER_OFF` handler
+    sent an early "best-effort" status reply anticipating a dead UART link
+    before this fix, which would have desynced the host's reply parser now
+    that the reply actually arrives normally. `KB_CMD_RESET` is unrelated
+    and still always reboots (that's its whole job).
+  - **Still just a mitigation, not a fix to the board's actual power
+    delivery:** 0 dBm was chosen as a conservative, clearly-safe-margin
+    starting point, not precisely tuned to the actual brown-out threshold -
+    it's plausible a higher power (e.g. 5-10 dBm) would also be safe on
+    this specific board, were someone to characterize the actual margin
+    (e.g. with a bench supply and a scope on the rail, per the suggested
+    next steps above). Sub-1GHz range/link budget is correspondingly
+    reduced from the preset's original default. If a board with a less
+    conservative power margin regresses on the now-un-forced stop path,
+    the previous always-reboot `stopJammer()` behavior is the right first
+    response - see git history for that version.
 
   **Bottom line:** the sub-1GHz radio's brown-out-reset problem, confirmed
   via the chip's own hardware reset-cause register, is now mitigated by

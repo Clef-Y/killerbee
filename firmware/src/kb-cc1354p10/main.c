@@ -595,28 +595,18 @@ static bool rfTransmitOnce(const uint8_t *frame, uint8_t len)
 #define JAM_MODE_CONSTANT   0x00
 #define JAM_MODE_REFLEXIVE  0x01
 
-/* IMPORTANT - sub-1GHz constant-carrier jamming breaks UART communication
- * as soon as it STARTS, not specifically when it's stopped. Verified: a
- * plain GET_CHANNEL (touches no RF state at all, just a UART round trip)
- * sent immediately after a successful sub-1GHz JAMMER_ON ack already gets
- * no reply, and this never self-recovers (polled 40s with zero external
- * intervention). The identical test on the 2.4 GHz jammer gets an
- * immediate, correct GET_CHANNEL reply, so this is specific to the
- * sub-1GHz (LO-divider) radio path, not "any active jammer".
- *
- * What is NOT known for certain: whether the M33 application core itself
- * is frozen solid (e.g. stuck later in some other unbounded RF driver
- * wait - see rfJamStop()'s comment on RFCDoorbellSendTo() for one such
- * mechanism) or whether the core keeps running fine but the physical
- * UART/USB-serial link itself is desensed/disrupted by the continuous
- * nearby RF emission. Distinguishing those needs halting the core and
- * inspecting its PC via the debug port, which wasn't done - the ARM
- * CoreDebug register access needed for that isn't available through the
- * simple DSLite CLI used elsewhere in this project. Practically it
- * doesn't change the prescription either way: don't rely on JAMMER_OFF
- * (or any other command) to recover a sub-1GHz constant jam once started
- * - treat starting it as a one-way trip requiring the JTAG UART-resync
- * step documented above afterward. */
+/* HISTORICAL, now fixed - kept because the diagnosis is worth keeping
+ * nearby to stopJammer()'s comment: sub-1GHz constant-carrier jamming used
+ * to break UART communication as soon as it STARTED (a plain GET_CHANNEL
+ * sent right after a successful sub-1GHz JAMMER_ON ack got no reply, no
+ * self-recovery even polled 40s). Root-caused to a hardware brown-out
+ * (VDDS_LOSS, confirmed via AON_PMCTL.RESETCTL - see README.md) from the
+ * PA's current inrush on TX key-up, not a software/UART-link problem -
+ * fixed by reducing sub-1GHz TX power to 0 dBm in kb_cc1354p10.syscfg.
+ * Retested live post-fix: JAMMER_ON(constant) on sub-1GHz followed
+ * immediately by GET_CHANNEL/PING now gets clean, correct replies, and
+ * stays alive through 5+ seconds of continuous transmission. See
+ * stopJammer()'s comment for the corresponding stop-path fix. */
 static rfc_CMD_TX_TEST_t rfCmdTxTest;
 static RF_CmdHandle jamCmdHandle = RF_ALLOC_ERROR;
 
@@ -788,21 +778,28 @@ static void *reflexJamThread(void *arg0)
 
 /* Stops whichever jam mode is currently active.
  *
- * Constant-carrier jamming on the sub-1GHz PHY is a special case: as
- * documented above rfJamStart(), UART communication is already gone by
- * the time anyone would call this (verified: it breaks immediately on
- * JAMMER_ON, not on stop), so calling stopJammer() via a normal command
- * dispatch mostly can't happen in practice - the host can't get a
- * JAMMER_OFF through either. This branch exists for defense in depth
- * (e.g. SET_CHANNEL/SNIFFER_ON/INJECT's internal "stop jammer first"
- * calls, reachable if a future fix restores mid-jam communication) and to
- * avoid ever calling RF_cancelCmd() on a CMD_TX_TEST posted against the
- * sub-1GHz radio setup - that path goes through RFCDoorbellSendTo()'s
- * unbounded register spin (see rfJamStop()'s comment), which cannot be
- * recovered from in software once entered. Forcing an immediate reboot
- * here is strictly safer than risking that spin, even though in practice
- * the board usually needs a JTAG-triggered recovery already, for the more
- * basic reason above. */
+ * Constant-carrier jamming on the sub-1GHz PHY: the original hazard here
+ * (UART communication going dead as soon as JAMMER_ON started, no
+ * self-recovery - see the brown-out investigation in README.md) was root-
+ * caused to a hardware brown-out (VDDS_LOSS, confirmed via
+ * AON_PMCTL.RESETCTL) from the PA's current inrush on TX key-up, and fixed
+ * by reducing sub-1GHz TX power to 0 dBm in kb_cc1354p10.syscfg. Retested
+ * live on real hardware after that fix: JAMMER_ON(constant) on sub-1GHz
+ * followed immediately by GET_CHANNEL/PING now gets clean, correct replies
+ * (matching README's own "5+ full seconds of continuous transmission"
+ * retest), where before it was 100% reproducible dead air. With the
+ * brown-out gone, RF_cancelCmd()'s RFCDoorbellSendTo() spin (see
+ * rfJamStop()'s comment) is no longer expected to hang either - it was the
+ * RF core dying mid-command from the same power-rail dip that would have
+ * left it unable to ack an abort request; a live core that never browned
+ * out has no such reason to fail to ack. Verified directly:
+ * JAMMER_ON(constant,ch9) -> JAMMER_OFF -> PING all succeeded with no
+ * reboot, repeated across multiple channels via SET_CHANNEL while jamming
+ * (see handleCommand's KB_CMD_SET_CHANNEL, which already stops/retunes/
+ * resumes jam mode around a channel change). No longer forcing a reboot
+ * here - if this regresses on a board with a less conservative power
+ * margin than the one this was tested on, the forced-reboot fallback this
+ * replaced is still the right first response; see git history. */
 static void stopJammer(void)
 {
     if (jamMode == JAM_MODE_REFLEXIVE) {
@@ -811,8 +808,6 @@ static void stopJammer(void)
             pthread_join(reflexThreadHandle, NULL);
             reflexThreadValid = false;
         }
-    } else if (currentBand == BAND_SUBG) {
-        SysCtrlSystemReset();  /* never returns */
     } else {
         rfJamStop();
     }
@@ -1038,17 +1033,14 @@ static void handleCommand(uint8_t cmd, const uint8_t *payload, uint8_t len)
     }
 
     case KB_CMD_JAMMER_OFF:
-        if (jammerOn && jamMode == JAM_MODE_CONSTANT && currentBand == BAND_SUBG) {
-            /* Best-effort only: UART communication has empirically already
-             * broken by the time a sub-1GHz constant jam is running (see
-             * rfJamStart()'s comment), so this command dispatch itself
-             * likely never got here over a live link, and this ack likely
-             * won't reach the host either. Kept anyway, mirroring
-             * KB_CMD_RESET, in case a future fix restores mid-jam
-             * communication - harmless no-op if it doesn't. */
-            sendStatus(cmd, STATUS_OK);
-            usleep(50000);
-        }
+        /* Used to special-case sub-1GHz constant-carrier with an early,
+         * best-effort status reply before stopJammer()'s forced reboot -
+         * UART was expected dead already at that point. Now that the
+         * brown-out root cause is fixed (see stopJammer()'s comment) and
+         * stopJammer() no longer reboots, that pre-emptive reply would be a
+         * real protocol bug (two status frames for one command, desyncing
+         * the host's reply parser) rather than a harmless no-op. Single
+         * normal reply, same as every other command. */
         stopJammer();
         sendStatus(cmd, STATUS_OK);
         break;
