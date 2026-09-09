@@ -189,6 +189,7 @@ def format_report(channels: List[int], dwell: float,
     total_packets = 0
     total_valid = 0
     all_addrs = set()
+    active_channels = 0
 
     for ch in channels:
         pkts = results.get(ch, [])
@@ -196,13 +197,18 @@ def format_report(channels: List[int], dwell: float,
         total_packets += len(pkts)
         total_valid += len(valid)
 
+        if not pkts:
+            # No activity on this channel - skip it entirely rather than
+            # print an empty section. With mostly-quiet channels being the
+            # norm on this band (see this session's scan history), a
+            # per-channel "No activity" block for every silent channel
+            # just buries the channels that actually had something.
+            continue
+
+        active_channels += 1
         lines.append("")
         lines.append("--- Channel %d (%.1f MHz) ---" % (ch, FREQ_MHZ[ch]))
         lines.append("  Packets captured: %d (%d with valid CRC)" % (len(pkts), len(valid)))
-
-        if not pkts:
-            lines.append("  No activity.")
-            continue
 
         rssis = [p["rssi_dbm"] for p in pkts if p["rssi_dbm"] is not None]
         if rssis:
@@ -227,10 +233,15 @@ def format_report(channels: List[int], dwell: float,
             if p.get("decode_error"):
                 lines.append("      (decode error: %s)" % p["decode_error"])
 
+    if active_channels == 0:
+        lines.append("")
+        lines.append("No activity on any of the %d channel(s) scanned." % len(channels))
+
     lines.append("")
     lines.append("=" * 72)
-    lines.append("Summary: %d packets total (%d valid CRC) across %d channel(s)"
-                  % (total_packets, total_valid, len(channels)))
+    lines.append("Summary: %d packets total (%d valid CRC) - %d of %d channel(s) "
+                  "had any activity"
+                  % (total_packets, total_valid, active_channels, len(channels)))
     if all_addrs:
         lines.append("Unique addresses seen: %s" % ", ".join(sorted(all_addrs)))
     else:
