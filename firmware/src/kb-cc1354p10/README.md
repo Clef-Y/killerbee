@@ -116,12 +116,16 @@ it while on `BAND_SUBG` rather than silently misbehave) and self-ACK
 (`SET_SELFACK` only takes effect through `CMD_IEEE_RX`'s frame-filter
 options).
 
-**The sub-1GHz PHY is meaningfully less reliable than 2.4GHz under
-sustained use** - found by a full regression pass exercising sniff/inject/
-jammer/reset on both bands plus repeated band switching. Two things here
-were genuine firmware bugs and are fixed; a third is a hardware/SDK-level
-reliability limit of the sub-1GHz radio path itself, not something this
-firmware can fix.
+**The sub-1GHz PHY was meaningfully less reliable than 2.4GHz under
+sustained use, traced to a real hardware brown-out reset and now
+mitigated** - found by a full regression pass exercising sniff/inject/
+jammer/reset on both bands plus repeated band switching, then root-caused
+via a live JTAG debug session down to the chip's own hardware reset-cause
+register (`AON_PMCTL.RESETCTL` reading `RESET_SRC=VDDS_LOSS`) during a
+reproduced failure - see the detailed writeup below for the full
+investigation, including two dead ends that were built up with real
+evidence and explicitly retracted after failing control tests, and the
+working fix (reduced sub-1GHz TX power) that followed from the diagnosis.
 
 - **Fixed:** `rfTransmitOnce()`'s sub-1GHz branch checked the TX command's
   completion status against the generic `DONE_OK` (0x0400), but
@@ -343,12 +347,55 @@ firmware can fix.
     power in `kb_cc1354p10.syscfg`'s PHY config, are the concrete next
     experiments, not yet tried in this project.
 
-  **Bottom line:** sustained sub-1GHz TX activity (constant jam, or
-  several back-to-back inject packets) can trigger a real brown-out reset
-  on this specific hardware setup, landing the chip in a stalled boot-ROM
-  state that needs the JTAG UART-resync step above (or a physical power
-  cycle) to recover from - confirmed via the chip's own hardware reset-
-  cause register, not a software hang this firmware can fix.
+  - **Fix applied and empirically confirmed: lowering sub-1GHz TX power to
+    0 dBm.** The PHY preset's TX power was never actually at the chip's
+    extreme +20 dBm high-PA mode (`highPA` defaults `false` in SysConfig's
+    radioconfig module) - it was already at a comparatively modest 12-14
+    dBm default (`RF_TxPowerTable_CC13x4Sub1GHz_DEFAULT_PA_ENTRY`, not the
+    high-PA table), yet still brown-out-reset the board. Set an explicit
+    `txPower: "0"` in `kb_cc1354p10.syscfg`'s sub-1GHz PHY args - confirmed
+    in the generated code as `TXSUB1_POWER_OVERRIDE(0x013297)`, the exact
+    0 dBm table entry, replacing the previous `0x00BE33` (12 dBm) entry.
+    Retested against every previously-reliable failure case: the
+    jammer-on-then-immediate-`GET_CHANNEL` hang (100% reproducible before,
+    at every power level and every other fix tried) now stays alive
+    through 5+ full seconds of continuous transmission; the 3+
+    back-to-back `inject()` hang (also 100% reproducible before `RF_yield`,
+    still frequently failing after it) now passes cleanly up to `count=20`,
+    across 5 repeated rounds (100 transmissions total, zero failures). This
+    is the first change in the entire investigation that measurably,
+    reliably fixed the symptom rather than reducing its frequency or
+    failing outright - strong retroactive confirmation of the brown-out
+    diagnosis. 2.4 GHz (already unaffected by any of this) re-verified
+    unaffected by the change.
+  - `DCDC_ACTIVE` in CCFG was checked too (`0` = DC/DC enabled during
+    active/RF operation, already TI's documented default/recommended
+    setting - `hw_ccfg.h`) and left as-is. Whether GLDO-only would respond
+    faster to the PA's initial current edge than the DC/DC's inductor-based
+    delivery is a genuine open tradeoff this project doesn't have enough
+    data to resolve, and the TX-power fix already worked - no need to
+    speculatively change a setting TI already recommends.
+  - **Not fully solved, just mitigated:** stopping the sub-1GHz constant
+    jammer still deliberately triggers `SysCtrlSystemReset()` (the
+    `stopJammer()` fix from earlier in this investigation, avoiding the
+    proven-hazardous `RF_cancelCmd()` path) and still needs the JTAG
+    UART-resync step afterward - that part of the design is unchanged and
+    intentional, not a regression. And this is still a power-delivery
+    mitigation, not a fix to the board's actual power delivery: 0 dBm was
+    chosen as a conservative, clearly-safe-margin starting point, not
+    precisely tuned to the actual brown-out threshold - it's plausible a
+    higher power (e.g. 5-10 dBm) would also be safe on this specific board,
+    were someone to characterize the actual margin (e.g. with a bench
+    supply and a scope on the rail, per the suggested next steps above).
+    Sub-1GHz range/link budget is correspondingly reduced from the
+    preset's original default.
+
+  **Bottom line:** the sub-1GHz radio's brown-out-reset problem, confirmed
+  via the chip's own hardware reset-cause register, is now mitigated by
+  reducing TX power - retested extensively and no longer reproduces under
+  any of the failure cases that were 100% reliable before. This remains a
+  firmware-side mitigation for a hardware power-delivery limitation, not a
+  fix to the underlying limitation itself.
 
 ## Wire protocol
 

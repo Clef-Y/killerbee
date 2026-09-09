@@ -70,11 +70,28 @@ phyInst.codeExportConfig.useMulti = false;
  *
  * Runtime-switched with the 2.4 GHz PHY above via RF_close()+RF_open() in
  * main.c (see its rfSwitchBand() comment for the tradeoffs of that
- * approach on this hardware). */
+ * approach on this hardware).
+ *
+ * txPower explicitly set to a conservative 0 dBm (default is 14, capped to
+ * this table's max of 12) and highPA left at its default false (the
+ * +20 dBm high-PA table is never used here). This is a real mitigation,
+ * not a guess: a hardware-confirmed brown-out reset (AON_PMCTL.RESETCTL
+ * RESET_SRC=VDDS_LOSS, read directly off the chip during a reproduced
+ * hang - see README's "Sub-1GHz support" section) was found to correlate
+ * with sub-1GHz TX key-up, most likely from the PA's current step
+ * exceeding what this board's power delivery (LP_EM_CC1354P10_1 through
+ * the LP-XDS110's jumper/ribbon power path) can sustain without the
+ * supply rail dipping below the brown-out threshold - even at the
+ * already-modest default 12-14 dBm this PHY preset was using. Lowering
+ * further reduces that current step. This does not fix the underlying
+ * power-delivery issue (a clean bench supply is the real fix) and has not
+ * yet been empirically confirmed to eliminate the brown-out - it's a
+ * reasonable firmware-side mitigation, not a proven cure. */
 const subgPhy = {
     args: {
         freqBand: "868",
-        phyType868: "qpsk6kbpsrm0"
+        phyType868: "qpsk6kbpsrm0",
+        txPower: "0"
     }
 };
 const subgPhyInst = commonRf.addPropPhy(customStack, subgPhy, false);

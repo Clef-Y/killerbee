@@ -152,6 +152,46 @@ static bool readExact(uint8_t *buf, size_t n)
     return true;
 }
 
+/* ==================== Diagnostic trace ring buffer ====================
+ * Written continuously during normal operation, read via a plain JTAG
+ * memory read (no halt needed) after a hang - unlike live register/PC
+ * snapshots, this doesn't require disturbing the system to observe it, so
+ * it isn't confounded by the JTAG-attach-itself-changes-state problem
+ * documented in the README. Symbol addresses: `tiarmnm kb_cc1354p10.out
+ * | grep trace` after building. */
+#define TRACE_LOG_SIZE 64
+
+typedef struct {
+    uint32_t seq;
+    uint8_t event;
+    uint8_t data;
+    uint16_t reserved;
+} TraceEntry;
+
+static volatile TraceEntry traceLog[TRACE_LOG_SIZE];
+static volatile uint8_t traceIdx = 0;
+static volatile uint32_t traceSeq = 0;
+
+#define TR_CMD_RX            0x01  /* data = cmd byte */
+#define TR_JAMMER_ON_REQ     0x02  /* data = mode (0=constant,1=reflexive) */
+#define TR_JAMSTART_TUNED    0x03  /* data = 1 ok / 0 fail */
+#define TR_JAMSTART_POSTED   0x04  /* data = 1 ok / 0 RF_ALLOC_ERROR */
+#define TR_INJECT_TX_BEGIN   0x05  /* data = iteration index i */
+#define TR_INJECT_TX_POSTED  0x06  /* data = 1 ok / 0 fail */
+#define TR_INJECT_YIELDED    0x07  /* data = iteration index i */
+#define TR_SET_CHANNEL_REQ   0x08  /* data = page */
+#define TR_BAND_SWITCH_DONE  0x09  /* data = targetBand */
+#define TR_UART_READEXACT_OK 0x0A  /* data = n bytes requested */
+
+static void trace(uint8_t event, uint8_t data)
+{
+    uint8_t idx = traceIdx;
+    traceIdx = (uint8_t)((idx + 1) % TRACE_LOG_SIZE);
+    traceLog[idx].seq = traceSeq++;
+    traceLog[idx].event = event;
+    traceLog[idx].data = data;
+}
+
 /* ==================== RF / sniffer state ==================== */
 
 #define IEEE_MAX_PSDU       127   /* max 802.15.4 PHY payload, incl. 2-byte FCS */
@@ -438,8 +478,10 @@ static RF_CmdHandle jamCmdHandle = RF_ALLOC_ERROR;
 static bool rfJamStart(uint8_t ch)
 {
     if (!rfTuneToChannel(ch)) {
+        trace(TR_JAMSTART_TUNED, 0);
         return false;
     }
+    trace(TR_JAMSTART_TUNED, 1);
 
     memset(&rfCmdTxTest, 0, sizeof(rfCmdTxTest));
     rfCmdTxTest.commandNo = CMD_TX_TEST;
@@ -453,6 +495,7 @@ static bool rfJamStart(uint8_t ch)
     rfCmdTxTest.syncWord = 0x930B51DE;
 
     jamCmdHandle = RF_postCmd(rfHandle, (RF_Op *)&rfCmdTxTest, RF_PriorityNormal, NULL, 0);
+    trace(TR_JAMSTART_POSTED, jamCmdHandle != RF_ALLOC_ERROR);
     return jamCmdHandle != RF_ALLOC_ERROR;
 }
 
@@ -662,6 +705,7 @@ static bool rfSwitchBand(uint8_t targetBand)
     }
 
     currentBand = targetBand;
+    trace(TR_BAND_SWITCH_DONE, targetBand);
     return true;
 }
 
@@ -669,6 +713,7 @@ static bool rfSwitchBand(uint8_t targetBand)
 
 static void handleCommand(uint8_t cmd, const uint8_t *payload, uint8_t len)
 {
+    trace(TR_CMD_RX, cmd);
     switch (cmd) {
     case KB_CMD_PING:
         sendReply(cmd, (const uint8_t *)FW_ID, (uint8_t)(sizeof(FW_ID) - 1));
@@ -690,6 +735,7 @@ static void handleCommand(uint8_t cmd, const uint8_t *payload, uint8_t len)
         }
         uint8_t newChannel = payload[0];
         uint8_t newPage = (len == 2) ? payload[1] : 0;
+        trace(TR_SET_CHANNEL_REQ, newPage);
         bool validRange = (newPage == 0 && newChannel >= 11 && newChannel <= 26)
                         || (newPage == 31 && newChannel >= 1 && newChannel <= 10);
         if (!validRange) {
@@ -767,7 +813,9 @@ static void handleCommand(uint8_t cmd, const uint8_t *payload, uint8_t len)
 
         bool ok = rfTuneToChannel(channel);
         for (uint8_t i = 0; ok && i < count; i++) {
+            trace(TR_INJECT_TX_BEGIN, i);
             ok = rfTransmitOnce(frame, frameLen);
+            trace(TR_INJECT_TX_POSTED, ok);
             /* TI's own rfPacketTx reference example (prop_rf) calls
              * RF_yield() after every single transmit, before preparing the
              * next one - releasing the RF core's "client active" hold
@@ -779,6 +827,7 @@ static void handleCommand(uint8_t cmd, const uint8_t *payload, uint8_t len)
              * unaffected. Matching TI's idiom here specifically to test
              * and (if it holds) fix that. */
             RF_yield(rfHandle);
+            trace(TR_INJECT_YIELDED, i);
             if (ok && (uint8_t)(i + 1) < count && delayMs > 0) {
                 usleep((unsigned int)delayMs * 1000);
             }
@@ -794,6 +843,7 @@ static void handleCommand(uint8_t cmd, const uint8_t *payload, uint8_t len)
 
     case KB_CMD_JAMMER_ON: {
         uint8_t mode = (len >= 1) ? payload[0] : JAM_MODE_CONSTANT;
+        trace(TR_JAMMER_ON_REQ, mode);
         if (mode != JAM_MODE_CONSTANT && mode != JAM_MODE_REFLEXIVE) {
             sendStatus(cmd, STATUS_ERROR);
             break;
@@ -888,6 +938,7 @@ static void *uartCommandThread(void *arg0)
         if (!readExact(&sof, 1) || sof != KB_SOF) {
             continue;
         }
+        trace(TR_UART_READEXACT_OK, 1);
 
         uint8_t hdr[2];
         if (!readExact(hdr, sizeof(hdr))) {
