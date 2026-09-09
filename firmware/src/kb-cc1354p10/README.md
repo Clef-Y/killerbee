@@ -117,6 +117,34 @@ it while on `BAND_SUBG` rather than silently misbehave) and self-ACK
 options). Constant-carrier jamming (`CMD_TX_TEST`) and plain sniff/inject
 work on both bands.
 
+**Two real bugs found and fixed by a full 2.4GHz + sub-1GHz regression
+pass** (see git history for the exact commit):
+
+- `rfTransmitOnce()`'s sub-1GHz branch checked the TX command's completion
+  status against the generic `DONE_OK` (0x0400), but `CMD_PROP_TX`
+  completes with `PROP_DONE_OK` (0x3400) - a different exact value per
+  `rf_prop_mailbox.h`. `rfPostAndPoll()` does an exact match, so every
+  sub-1GHz `inject()` was rejected immediately (not hung - the status was
+  already `>= 0x0400`, just not equal to the wrong constant being checked).
+  Fixed by including `rf_prop_mailbox.h` and checking `PROP_DONE_OK`.
+- `rfJamStop()`'s and `rfSniffStop()`'s calls to `RF_cancelCmd()` were
+  unbounded, blocking waits - the same unreliable-blocking-wait class of
+  issue as `RF_close()`/`RF_pendCmd()` elsewhere in this file, just via a
+  different TI driver call. This reliably hung when stopping the
+  **sub-1GHz constant-carrier jammer** specifically (2.4 GHz jammer
+  start/stop was unaffected in testing). Fixed with `rfCancelCmdBounded()`:
+  `RF_cancelCmd()` now runs in a helper thread with a 1-second deadline
+  (`sem_timedwait()`); if it doesn't return in time, the firmware fails
+  safe with the same `SysCtrlSystemReset()` full reboot `KB_CMD_RESET`
+  uses, rather than wedging the UART command loop forever. This converts
+  an unrecoverable-without-diagnosis hang into a deterministic ~1s reboot -
+  but **that reboot still needs the JTAG UART-resync workaround above** to
+  talk to the board again afterward, so turning off the sub-1GHz constant
+  jammer can currently cost you the serial connection. Root-causing why
+  `RF_cancelCmd()` itself hangs only for a `CMD_TX_TEST` posted against the
+  sub-1GHz radio setup (and not the 2.4 GHz one) would need deeper access
+  to the RF core/driver internals than this project has visibility into.
+
 ## Wire protocol
 
 921600 baud, 8N1, no flow control, no CRC (short USB-serial link, matches the
@@ -149,11 +177,24 @@ and includes the real received FCS bytes on RX since `rxConfig.bIncludeCrc=1`).
 **RESET triggers a full chip reboot** (`SysCtrlSystemReset()`), not just a
 logical state reset - see the troubleshooting section below for why. The
 `[status]` reply is sent immediately before the reboot, so it does arrive,
-but the target chip (and therefore its UART) briefly goes away while it
+but the target chip (and therefore its UART) then goes away while it
 reboots. The debug probe's own USB connection to the host is unaffected
-(it's a separate USB device from the target chip), so on Linux this has
-been observed to *not* require replugging/reconnecting - just a short
-pause before the target responds again.
+(it's a separate USB device from the target chip), **but a full 2.4GHz +
+sub-1GHz regression pass found the UART backchannel does *not* reliably
+come back on its own** after the reboot when talking through the
+standalone LP-XDS110 probe - PING got no response even after several
+seconds of polling, and raw serial reads on the port started blocking past
+their configured timeout. The same external JTAG-level board reset
+described below reliably brings it back (~1-2s) and is required after
+*every* full chip reboot, not just occasionally - this includes both an
+explicit `RESET` command and the automatic hang-fail-safe reboot described
+in "Sub-1GHz support" below. Earlier testing in this repo's history
+suggested this reconnect wasn't needed; that turned out not to hold up
+under a full, repeated test pass and the docs here are corrected
+accordingly. Practically: a `KillerBee` session cannot recover from calling
+`driver.reset()` (or from triggering the jammer-cancel fail-safe) purely
+over the serial port - a debug probe and DSLite (or a physical power
+cycle) are required to restore communication afterward.
 
 ## Building
 
@@ -236,10 +277,23 @@ an external JTAG-level board reset through the debug probe has the same
 effect and needs no reflash:
 
 ```sh
-/opt/ti/uniflash_sl/deskdb/content/TICloudAgent/linux/ccs_base/DebugServer/bin/DSLite memory \
+/opt/ti/uniflash_sl/dslite.sh --mode memory \
     -c firmware/src/kb-cc1354p10/CC1354P10_XDS110.ccxml -r 0x0,4 -o /tmp/discard.bin -e
 ```
 
 (Any DSLite operation that connects and does its usual GEL-script board
 reset works - this one is just a minimal, side-effect-free memory read
-chosen for that reason.)
+chosen for that reason. Note the `--mode memory` flag: `dslite.sh` selects
+its mode via `--mode <name>`, not a bare positional argument - passing
+`memory` as a positional arg is silently ignored and the tool falls back
+to its default flash-mode help text, which looks like it worked but never
+actually touches the target.)
+
+If the debug probe itself stops responding entirely (`DSLite`/`xds110reset`
+failing with `Error -261: Invalid response was received from the XDS110`,
+even for an unrelated no-op like `--help`), that's the LP-XDS110's own
+onboard firmware wedged, not the target - a USB bus reset
+(`USBDEVFS_RESET`) and toggling DFU mode were not sufficient to clear it in
+practice, but a real physical unplug/replug of the probe's USB cable to
+the host was. The physical reset button on top of the XDS110 board only
+resets the *target* chip and does not help with this class of fault.

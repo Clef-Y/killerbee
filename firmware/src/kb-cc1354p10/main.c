@@ -50,6 +50,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <semaphore.h>
+#include <time.h>
 
 #include <ti/drivers/UART2.h>
 #include <ti/drivers/GPIO.h>
@@ -61,6 +62,7 @@
 #include DeviceFamily_constructPath(driverlib/rf_ieee_cmd.h)
 #include DeviceFamily_constructPath(driverlib/rf_ieee_mailbox.h)
 #include DeviceFamily_constructPath(driverlib/rf_prop_cmd.h)
+#include DeviceFamily_constructPath(driverlib/rf_prop_mailbox.h)
 #include DeviceFamily_constructPath(driverlib/sys_ctrl.h)
 
 #include "ti_drivers_config.h"
@@ -269,6 +271,10 @@ static void *rfForwardThread(void *arg0)
  * since, unlike CMD_IEEE_RX, CMD_PROP_RX has no channel field of its own. */
 static bool rfTuneToChannel(uint8_t ch);
 
+/* Forward declaration - rfSniffStop() needs the bounded RF_cancelCmd()
+ * wrapper defined down in the jammer section (shared with rfJamStop()). */
+static void rfCancelCmdBounded(RF_CmdHandle h);
+
 static bool rfSniffStartSubg(uint8_t ch)
 {
     if (!rfTuneToChannel(ch)) {
@@ -315,8 +321,9 @@ static bool rfSniffStart(uint8_t ch)
 static void rfSniffStop(void)
 {
     if (sniffCmdHandle != RF_ALLOC_ERROR) {
-        RF_cancelCmd(rfHandle, sniffCmdHandle, 0);
+        RF_CmdHandle h = sniffCmdHandle;
         sniffCmdHandle = RF_ALLOC_ERROR;
+        rfCancelCmdBounded(h);
     }
 }
 
@@ -378,9 +385,14 @@ static bool rfTuneToChannel(uint8_t ch)
 static bool rfTransmitOnce(const uint8_t *frame, uint8_t len)
 {
     if (currentBand == BAND_SUBG) {
+        /* CMD_PROP_TX completes with PROP_DONE_OK (0x3400), not the
+         * generic DONE_OK (0x0400) - rfPostAndPoll() checks status for an
+         * exact match, so using the wrong constant here made every
+         * sub-1GHz inject() fail immediately (not hang) despite the
+         * transmit actually completing on the wire. */
         RF_cmdPropTx.pktLen = len;
         RF_cmdPropTx.pPkt = (uint8_t *)frame;
-        return rfPostAndPoll((RF_Op *)&RF_cmdPropTx, DONE_OK);
+        return rfPostAndPoll((RF_Op *)&RF_cmdPropTx, PROP_DONE_OK);
     }
 
     RF_cmdIeeeTx.payloadLen = len;
@@ -417,11 +429,53 @@ static bool rfJamStart(uint8_t ch)
     return jamCmdHandle != RF_ALLOC_ERROR;
 }
 
+/* RF_cancelCmd() is documented as a synchronous call that waits for the RF
+ * core to actually abort the command. Empirically (full 2.4GHz + sub-1GHz
+ * regression test, see README) it can hang indefinitely just like
+ * RF_pendCmd()/RF_close() were already found to under this hardware's
+ * "stuck RF core" failure mode - reproduced specifically via the sub-1GHz
+ * CMD_TX_TEST constant jammer's stop path. Bound the wait in a helper
+ * thread and, if RF_cancelCmd doesn't return promptly, fail safe exactly
+ * like KB_CMD_RESET does: a full SysCtrlSystemReset() reboot rather than
+ * hanging forever. The watchdog thread is simply abandoned in the timeout
+ * case (moot - the whole chip reboots). */
+static sem_t jamCancelDoneSem;
+
+static void *jamCancelThread(void *arg)
+{
+    RF_CmdHandle h = (RF_CmdHandle)(intptr_t)arg;
+    RF_cancelCmd(rfHandle, h, 0);
+    sem_post(&jamCancelDoneSem);
+    return NULL;
+}
+
+static void rfCancelCmdBounded(RF_CmdHandle h)
+{
+    sem_init(&jamCancelDoneSem, 0, 0);
+
+    pthread_t t;
+    pthread_attr_t attrs;
+    pthread_attr_init(&attrs);
+    pthread_attr_setdetachstate(&attrs, PTHREAD_CREATE_DETACHED);
+    pthread_attr_setstacksize(&attrs, 768);
+    if (pthread_create(&t, &attrs, jamCancelThread, (void *)(intptr_t)h) != 0) {
+        SysCtrlSystemReset();  /* never returns */
+    }
+
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += 1;  /* generous margin for an abrupt (mode=0) abort */
+    if (sem_timedwait(&jamCancelDoneSem, &ts) != 0) {
+        SysCtrlSystemReset();  /* never returns */
+    }
+}
+
 static void rfJamStop(void)
 {
     if (jamCmdHandle != RF_ALLOC_ERROR) {
-        RF_cancelCmd(rfHandle, jamCmdHandle, 0);
+        RF_CmdHandle h = jamCmdHandle;
         jamCmdHandle = RF_ALLOC_ERROR;
+        rfCancelCmdBounded(h);
     }
 }
 
