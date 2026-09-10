@@ -4,6 +4,8 @@
  * SysConfig script for the KillerBee CC1352P7 sniffer/injector/jammer
  * firmware. Configures:
  *   - RF driver on the native 2.4 GHz IEEE 802.15.4 PHY (channels 11-26)
+ *   - RF driver on the 915 MHz SUN O-QPSK sub-1GHz PHY (KillerBee page 31,
+ *     channels 0-128) - see the block below for the full story
  *   - UART2 on the LaunchPad's onboard XDS110 backchannel (the same
  *     /dev/ttyACM* serial port already used to talk to the debug probe)
  *
@@ -15,7 +17,11 @@
  * Sibling of ../kb-cc1354p10 - see that firmware's main.c for the shared
  * implementation. This is a secondary/alternate target: the CC1354P10 +
  * standalone LP-XDS110 pairing is the project's default hardware, see
- * README.md.
+ * README.md. This file's sub-1GHz PHY block mirrors kb_cc1354p10.syscfg's
+ * exactly (same freqBand/phyType868/txPower args) - CC1352P7's SDK config
+ * (cc1352p7_prop_pg10) offers the identical "868"/qpsk6kbpsrm0 SUN O-QPSK
+ * Rate Mode 0 preset CC1354P10 uses, confirmed against the installed SDK
+ * before porting rather than assumed.
  */
 // @cliArgs --board /ti/boards/LP_CC1352P7_1 --rtos tirtos7
 
@@ -64,6 +70,53 @@ const customStack = scripting.addModule("/ti/devices/radioconfig/custom");
 const phyInst = commonRf.addIeeePhy(customStack, default154Phy);
 phyInst.$name = "RF_Settings_IEEE_802_15_4";
 phyInst.codeExportConfig.useMulti = false;
+
+/* ======== Radio Configuration: 915 MHz Wi-SUN (sub-1GHz) PHY ========
+ * NOT the same PHY as kb_cc1354p10.syscfg's sub-1GHz config, and this is
+ * a real hardware/SDK difference, not a shortcut: CC1354P10 uses a SUN
+ * O-QPSK Rate Mode 0 preset, but CC1352P7's radio-config database
+ * (cc1352p7_prop_pg10, checked directly against the installed SDK) has NO
+ * O-QPSK phyType868 option at all - only 2-GFSK/OOK/SLR/WBDSSS variants,
+ * confirmed by enumerating every valid option via a failed SysConfig
+ * build attempt with the O-QPSK preset name (which listed all valid
+ * alternatives in its error). This is a genuine difference between the
+ * CC13x2 (this chip) and CC13x4 (CC1354P10) RF core generations' SysConfig
+ * package, not a config mistake.
+ *
+ * Using "2gfsk50kbps25dev915wsun1b" instead - Wi-SUN mode #1b, a real,
+ * standards-compliant IEEE 802.15.4g SUN PHY for the 915 MHz region, just
+ * FSK-modulated rather than O-QPSK. Jamming (CMD_TX_TEST is modulation-
+ * agnostic garbage/carrier) and ambient RSSI (CMD_GET_RSSI, a raw RF-core
+ * energy read) both work identically to the CC1354P10. Sniffing/decode
+ * only works against other FSK-modulated Wi-SUN 1b traffic, NOT the
+ * O-QPSK traffic the CC1354P10 targets - a real capability difference to
+ * document clearly, not paper over.
+ *
+ * txPower conservatively set to 0 dBm, same rationale as
+ * kb_cc1354p10.syscfg: a hardware brown-out mitigation found on the
+ * CC1354P10 from the PA's current step on TX key-up exceeding what that
+ * board's power delivery could sustain - not yet independently
+ * characterized on this board's own power delivery path, so kept equally
+ * conservative here rather than assumed safe at a higher power.
+ *
+ * Runtime-switched with the 2.4 GHz PHY above via RF_close()+RF_open() in
+ * main.c - see its rfSwitchBand() comment. */
+const subgPhy = {
+    args: {
+        freqBand: "868",
+        phyType868: "2gfsk50kbps25dev915wsun1b",
+        txPower: "0",
+        // Without an explicit override, SysConfig's computed default for
+        // this preset (derived from other packet-length-mode settings, not
+        // a plain literal) came out invalid ("Max Packet Length must be
+        // between 0 and 255") - 255 matches this firmware's other PHYs'
+        // max PSDU handling (IEEE_MAX_PSDU - 2 elsewhere in main.c).
+        packetLengthRx: 255
+    }
+};
+const subgPhyInst = commonRf.addPropPhy(customStack, subgPhy, false);
+subgPhyInst.$name = "RF_Settings_SUBG_OQPSK";
+subgPhyInst.codeExportConfig.useMulti = false;
 
 /* ======== RF Design ======== */
 var rfDesign = scripting.addModule("ti/devices/radioconfig/rfdesign");

@@ -19,8 +19,16 @@ Wire protocol is identical to the CC1354P10's (921600 8N1):
                    [0xA5][0x90]    [LEN][LEN bytes payload]     (async RX frame)
 
   CMD_PING         0x01  -> reply payload = ASCII firmware ID string
-  CMD_GET_CHANNEL  0x02  -> reply payload = [channel]
-  CMD_SET_CHANNEL  0x03  payload=[channel]                    -> reply [status]
+  CMD_GET_CHANNEL  0x02  -> reply payload = [channel][page]
+  CMD_SET_CHANNEL  0x03  payload=[channel] or [channel][page]  -> reply [status]
+                         page 0 = 2.4GHz (channel 11-26, default if page
+                         omitted); page 31 = 915MHz US ISM Wi-SUN mode #1b
+                         (channel 0-128, 902.2 + 0.2*channel MHz - same
+                         channel plan as the CC1354P10, since CMD_FS tunes
+                         frequency independent of modulation/PHY preset;
+                         NOTE this chip's sub-1GHz PHY is FSK-based
+                         Wi-SUN, not the CC1354P10's O-QPSK - see
+                         firmware/src/kb-cc1352p7/README.md).
   CMD_SNIFFER_ON   0x04  -> reply [status]
   CMD_SNIFFER_OFF  0x05  -> reply [status]
   CMD_INJECT       0x06  payload=[count][delay_ms lo][delay_ms hi][frame...]
@@ -28,6 +36,12 @@ Wire protocol is identical to the CC1354P10's (921600 8N1):
   CMD_JAMMER_OFF   0x08
   CMD_SET_SELFACK  0x09  payload=[enable]
   CMD_RESET        0x0A
+  CMD_GET_RSSI     0x0B  -> reply payload = [rssi int8]
+                         Ambient channel energy via TI's RF_getRssi(), a
+                         single direct/immediate RF-core call. REQUIRES an
+                         active RX operation (i.e. SNIFFER_ON already
+                         sent) or it returns TI's own documented error
+                         sentinel, RF_GET_RSSI_ERROR_VAL = -128.
 
   Async packet (CMD 0x90) payload:
       [rssi int8][crc_ok uint8][timestamp uint32 LE][framelen uint8][frame...]
@@ -60,6 +74,9 @@ CMD_JAMMER_ON: int = 0x07
 CMD_JAMMER_OFF: int = 0x08
 CMD_SET_SELFACK: int = 0x09
 CMD_RESET: int = 0x0A
+CMD_GET_RSSI: int = 0x0B
+
+RF_GET_RSSI_ERROR_VAL: int = -128
 
 CMD_REPLY_BIT: int = 0x80
 CMD_ASYNC_PACKET: int = 0x90
@@ -103,7 +120,7 @@ class CC1352P7:
         self.capabilities.setcapab(KBCapabilities.FREQ_863, False)
         self.capabilities.setcapab(KBCapabilities.FREQ_868, False)
         self.capabilities.setcapab(KBCapabilities.FREQ_870, False)
-        self.capabilities.setcapab(KBCapabilities.FREQ_915, False)
+        self.capabilities.setcapab(KBCapabilities.FREQ_915, True)
 
         self.capabilities.setcapab(KBCapabilities.SNIFF, True)
         self.capabilities.setcapab(KBCapabilities.SETCHAN, True)
@@ -227,13 +244,22 @@ class CC1352P7:
 
     def set_channel(self, channel: int, page: int = 0) -> None:
         self.capabilities.require(KBCapabilities.SETCHAN)
-        if page:
-            raise Exception('SubGHz not supported on this device')
-        if channel < 11 or channel > 26:
-            raise Exception('Invalid channel')
-        status = self.__command(CMD_SET_CHANNEL, bytes([channel]))
+        if page == 0:
+            if channel < 11 or channel > 26:
+                raise Exception('Invalid channel')
+        elif page == 31:
+            self.capabilities.require(KBCapabilities.FREQ_915)
+            if channel < 0 or channel > 128:
+                raise Exception('Invalid channel (must be 0-128 for the 915 MHz US ISM '
+                                 'band - 902.2 + 0.2*channel MHz, same channel plan as '
+                                 'the CC1354P10; this chip uses a Wi-SUN FSK PHY instead '
+                                 'of O-QPSK for RX/TX, see firmware/src/kb-cc1352p7/'
+                                 'README.md)')
+        else:
+            raise Exception('Unsupported page %d - only 0 (2.4 GHz) and 31 (915 MHz) exist on this device' % page)
+        status = self.__command(CMD_SET_CHANNEL, bytes([channel, page]))
         if status[0] != STATUS_OK:
-            raise Exception("Device rejected channel %d" % channel)
+            raise Exception("Device rejected channel %d (page %d)" % (channel, page))
         self._channel = channel
         self._page = page
 
@@ -357,3 +383,23 @@ class CC1352P7:
     def reset(self) -> None:
         '''Resets the firmware's RF/channel/self-ack state to defaults.'''
         self.__command(CMD_RESET)
+
+    def get_rssi(self) -> Optional[int]:
+        '''
+        Samples ambient RF energy on the current channel via TI's
+        RF_getRssi(), independent of packet capture - i.e. this reports a
+        real reading even on a channel with zero traffic.
+
+        REQUIRES sniffer_on() to already be active (an RX operation must be
+        running on the RF core for the radio to have a live RSSI value).
+        Returns None if no RX operation is running, mirroring TI's own
+        RF_GET_RSSI_ERROR_VAL sentinel rather than returning the raw,
+        misleading -128.
+        '''
+        payload = self.__command(CMD_GET_RSSI)
+        if len(payload) < 1:
+            raise Exception("Malformed GET_RSSI reply")
+        rssi = struct.unpack('b', payload[0:1])[0]
+        if rssi == RF_GET_RSSI_ERROR_VAL:
+            return None
+        return rssi
