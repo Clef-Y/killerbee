@@ -226,6 +226,16 @@ static uint8_t currentBand = BAND_24GHZ;
 static uint8_t currentPage = 0;
 
 static uint8_t channel = 11;
+/* Cache of the last channel actually posted to the synth via rfTuneToChannel()'s
+ * CMD_FS, so repeated same-channel calls (e.g. every single CMD_INJECT, which
+ * unconditionally re-tunes before each TX) can skip a redundant RF_postCmd().
+ * Matters because that RF_postCmd() draws from the RF driver's fixed 8-entry
+ * command pool (N_CMD_POOL) and this firmware never reclaims a completed
+ * command's slot (see rfPostAndPoll()'s comment) - so every avoidable post
+ * directly buys back exhausted-pool headroom. Invalidated on band switch
+ * since the same channel number means a different frequency per band. */
+static bool lastTuneValid = false;
+static uint8_t lastTunedChannel = 0xFF;
 static bool snifferOn = false;
 static bool jammerOn = false;
 static uint8_t jamMode = 0; /* JAM_MODE_CONSTANT/JAM_MODE_REFLEXIVE, defined below */
@@ -515,7 +525,19 @@ static bool rfPostAndPoll(RF_Op *op, uint16_t okStatus)
     for (uint32_t waitedUs = 0; waitedUs < 200000; waitedUs += 1000) {
         uint16_t st = op->status;
         if (st >= 0x0400) {
-            return (st == okStatus);
+            bool ok = (st == okStatus);
+            /* Reclaims the RF driver's fixed 8-entry command pool slot -
+             * see README.md's "CMD_INJECT exhausts the RF driver's command
+             * pool" section for the full story, including why RF_pendCmd()
+             * (confirmed to hang here even on an already-finished command)
+             * isn't usable for this instead. RF_cancelCmd() was already
+             * proven safe in this exact firmware on the timeout path below;
+             * confirmed on real hardware to also reclaim the slot when
+             * called here, on a normally-completed command - 100+
+             * sequential injects with no exhaustion, vs. 4 before this
+             * fix. */
+            RF_cancelCmd(rfHandle, h, 0);
+            return ok;
         }
         usleep(1000);
     }
@@ -560,6 +582,11 @@ static bool rfPostAndPoll(RF_Op *op, uint16_t okStatus)
  * see README.md's Sub-1GHz support section for that caveat, still true. */
 static bool rfTuneToChannel(uint8_t ch)
 {
+    if (lastTuneValid && ch == lastTunedChannel) {
+        return true;
+    }
+
+    bool ok;
     if (currentBand == BAND_SUBG) {
         /* Floating point (this core has an FPU; this runs once per channel
          * change, not a hot loop) to mirror TI's own conversion exactly
@@ -571,12 +598,18 @@ static bool rfTuneToChannel(uint8_t ch)
 
         RF_cmdFsSubg.frequency = (uint16_t)intPart;
         RF_cmdFsSubg.fractFreq = (uint16_t)fractCmd;
-        return rfPostAndPoll((RF_Op *)&RF_cmdFsSubg, DONE_OK);
+        ok = rfPostAndPoll((RF_Op *)&RF_cmdFsSubg, DONE_OK);
+    } else {
+        RF_cmdFs.frequency = (uint16_t)(2405 + 5 * (ch - 11));
+        RF_cmdFs.fractFreq = 0;
+        ok = rfPostAndPoll((RF_Op *)&RF_cmdFs, DONE_OK);
     }
 
-    RF_cmdFs.frequency = (uint16_t)(2405 + 5 * (ch - 11));
-    RF_cmdFs.fractFreq = 0;
-    return rfPostAndPoll((RF_Op *)&RF_cmdFs, DONE_OK);
+    if (ok) {
+        lastTuneValid = true;
+        lastTunedChannel = ch;
+    }
+    return ok;
 }
 
 static bool rfTransmitOnce(const uint8_t *frame, uint8_t len)
@@ -880,6 +913,7 @@ static bool rfSwitchBand(uint8_t targetBand)
     }
 
     currentBand = targetBand;
+    lastTuneValid = false; /* same channel number means a different frequency per band */
     trace(TR_BAND_SWITCH_DONE, targetBand);
     return true;
 }

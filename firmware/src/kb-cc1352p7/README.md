@@ -170,6 +170,14 @@ mirrors the CC1354P10's own rotating-jam validation. `RESET` also
 verified, same "needs a `dslite.sh --mode memory` nudge afterward"
 behavior as the CC1354P10.
 
+**CMD_INJECT command-pool exhaustion:** same root cause and same fix as
+the CC1354P10 - see that README's "CMD_INJECT exhausts the RF driver's
+command pool after repeated calls" section, including the real fix
+(`RF_cancelCmd()` after normal completion, not just the retune-cache
+mitigation). Confirmed independently on this board at every stage: 4
+before the retune-cache fix, 8 after, 100/100 with zero failures after the
+`RF_cancelCmd()` fix - all matching the CC1354P10 exactly.
+
 **Found during this pass, not a regression:** the 2.4GHz<->sub-1GHz band
 switch hung once (see "Known shared risk" above) - recovered via the
 documented JTAG nudge, and a retry succeeded. Intermittent behavior

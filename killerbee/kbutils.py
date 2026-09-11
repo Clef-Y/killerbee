@@ -490,6 +490,7 @@ def iscc1354p10(serialdev: str) -> bool:
         return False
 
     try:
+        time.sleep(0.2)  # let USB CDC-ACM enumeration and firmware settle
         s.reset_input_buffer()
         s.write(bytes([0xA5, 0x01, 0x00]))  # KB_SOF, CMD_PING, LEN=0
         sof = s.read(1)
@@ -521,6 +522,7 @@ def iscc1352p7(serialdev: str) -> bool:
         return False
 
     try:
+        time.sleep(0.2)  # let USB CDC-ACM enumeration and firmware settle
         s.reset_input_buffer()
         s.write(bytes([0xA5, 0x01, 0x00]))  # KB_SOF, CMD_PING, LEN=0
         sof = s.read(1)

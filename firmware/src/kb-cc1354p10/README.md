@@ -673,3 +673,59 @@ onboard firmware wedged, not the target - a USB bus reset
 practice, but a real physical unplug/replug of the probe's USB cable to
 the host was. The physical reset button on top of the XDS110 board only
 resets the *target* chip and does not help with this class of fault.
+
+## CMD_INJECT exhausts the RF driver's command pool after repeated calls
+
+Root-caused on real hardware: every `CMD_INJECT` posts at least one RF
+command (`CMD_IEEE_TX`/`CMD_PROP_TX`, via `rfPostAndPoll()`) and, before
+this was fixed, an unconditional channel re-tune (`CMD_FS`) as well, even
+when already tuned to the requested channel. `rfPostAndPoll()` polls the
+command's raw `.status` field directly and never calls `RF_pendCmd()` -
+deliberately, per the header comment above `rfPostAndPoll()`: that call was
+observed to hang indefinitely on this hardware/SDK combination, even
+called *after* the command had already completed (confirmed again during
+this investigation - see below). But `RF_pendCmd()` (or the completion
+callback it drives) is also the only thing that reclaims a slot in the TI
+RF driver's fixed 8-entry command pool (`N_CMD_POOL` in
+`RFCC26X2_multiMode.c`). Never calling it means every `rfPostAndPoll()`
+call permanently leaks one pool slot - so before the fix, `CMD_INJECT`
+(2 posts each: retune + TX) hard-failed with `STATUS_ERROR` after exactly
+4 real over-the-air injects, and every other RF command after that, with
+`PING`/`GET_CHANNEL` still responsive throughout (not the same failure
+class as the RESET-related wedge above - no JTAG nudge needed to tell
+them apart, but one is needed to clear either).
+
+Tried and rejected: calling `RF_pendCmd(rfHandle, h, 0)` immediately after
+`rfPostAndPoll()`'s own poll already confirms the command is terminal.
+Per the TI driver's documented contract, a call against an
+already-finished command should just return `RF_EventLastCmdDone`
+immediately rather than block. Tested directly on this hardware anyway:
+it hangs the same way, every time - the whole UART command loop wedges
+(same symptom as the RESET issue above, same JTAG-nudge recovery). So the
+documented "no-op on a finished command" contract doesn't hold here,
+consistent with `RF_pendCmd()` already being off the table for this
+firmware for the same underlying reason.
+
+First shipped as a partial mitigation: `rfTuneToChannel()` caches the last
+channel it actually tuned to and skips the `CMD_FS` post entirely when
+asked to retune to the same channel (invalidated on band switch, where the
+same channel number means a different frequency). This doesn't reclaim any
+pool slots - it just avoids wasting one on redundant retunes - but it
+halved `CMD_INJECT`'s cost from 2 posts to 1 for the common repeated-same-
+channel case, doubling the number of real over-the-air injects available
+per boot/JTAG-nudge from 4 to 8. Kept - it's a real, free efficiency win
+regardless of the fix below.
+
+**Actual fix, found afterward:** `RF_cancelCmd(rfHandle, h, 0)` called
+right after `rfPostAndPoll()`'s own poll confirms the command is terminal
+- i.e. the same call already used lower down on the genuine-timeout path,
+just also applied to the normal-completion path. Per the TI driver's docs
+this "has no effect" on an already-finished command, same wording that
+turned out to be false for `RF_pendCmd()` above - but tested directly on
+real hardware, `RF_cancelCmd()` behaves differently: no hang, and it does
+reclaim the pool slot. Confirmed with 100 sequential real over-the-air
+injects with zero failures (was capped at 8), repeated on both the
+CC1354P10 and CC1352P7, with no timing regression (~30-40ms/call
+throughout, no growth). This looks like a full fix rather than a bigger
+but still-finite budget - worth staying skeptical of until it's seen more
+runtime, but nothing in this session's testing contradicts that.
