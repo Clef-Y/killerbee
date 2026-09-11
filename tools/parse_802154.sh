@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# Usage: ./parse_802154.py [file_or_dir]
+# Usage: ./parse_802154.sh [file_or_dir]
+# Requires the project's venv already active (same convention as every
+# other tools/* script) - see MACOS_SETUP.md/USAGE_GUIDE.md.
 
-TARGET="${1:-/home/mike/killerbee}"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TARGET="${1:-$REPO_ROOT}"
 
 # Collect pcap files (either a single passed file or all .pcap files in the directory)
 if [ -f "$TARGET" ]; then
@@ -21,7 +24,7 @@ if [ ${#PCAP_FILES[@]} -eq 0 ]; then
 fi
 
 # Pass collected files to Python via environment and heredoc
-PYTHONPATH=/home/mike/killerbee /home/mike/killerbee/.venv/bin/python3 - "${PCAP_FILES[@]}" << 'EOF'
+PYTHONPATH="$REPO_ROOT" python3 - "${PCAP_FILES[@]}" << 'EOF'
 import sys
 import datetime
 from scapy.utils import rdpcap

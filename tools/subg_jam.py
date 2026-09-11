@@ -26,6 +26,7 @@ it WILL wedge the board on the first channel - see the README for the
 JTAG recovery procedure.
 
 Usage:
+    python3 tools/subg_jam.py -i /dev/cu.usbmodemLS4501DC1 -c 9,14,15,19,20,24,106 --dwell 0.036
     python3 tools/subg_jam.py -c 9,14,15,19,20,24,106 --dwell 2
     python3 tools/subg_jam.py -c 9,14,15,19,20,24,106 --dwell 1 --cycles 5
     python3 tools/subg_jam.py -c 9,14,15,19,20,24,106 --dwell 2 --duration 300

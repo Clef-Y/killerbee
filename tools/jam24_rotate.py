@@ -24,6 +24,7 @@ network); channel 25 is otherwise silent but showed a receiver image-
 leakage artifact from channel 11's strong signal during a full-band scan.
 
 Usage:
+    python3 tools/jam24_rotate.py -i /dev/cu.usbmodemL45003IW1 -c 11,12,13,14,15,20,22,26 --dwell 0.036
     python3 tools/jam24_rotate.py
     python3 tools/jam24_rotate.py -c 11,25 --dwell 5
     python3 tools/jam24_rotate.py -c 11,15,20,25 --dwell 2 --cycles 10
