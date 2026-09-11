@@ -104,12 +104,22 @@ class CC1352P7:
         self.__stream_open: bool = False
         self.__pending_pkts: List[bytes] = []
 
+        # Fixed for the handle's whole lifetime - see __read_exact() for why
+        # this must never be reassigned after construction.
         self.handle = serial.Serial(port=self.dev, baudrate=921600,
-                                     timeout=0.5, bytesize=8, parity='N',
+                                     timeout=0.1, bytesize=8, parity='N',
                                      stopbits=1, xonxoff=0)
         # Let the target's USB CDC-ACM enumeration and firmware settle.
         time.sleep(0.2)
         self.handle.reset_input_buffer()
+        # reset_input_buffer() alone isn't enough: macOS's CDC-ACM driver can
+        # still be delivering a previous session's leftover response bytes
+        # (already in flight over USB when the flush ran) if this port was
+        # recently opened/closed elsewhere (e.g. zbid's own probing). Drain
+        # until genuinely empty so the first real command's reply can't get
+        # misframed by stale bytes ahead of it.
+        while self.handle.read(64):
+            pass
 
         self.capabilities: KBCapabilities = KBCapabilities()
         self.__set_capabilities()
@@ -150,14 +160,21 @@ class CC1352P7:
         handle = self.handle
         if handle is None:
             raise Exception("Handle does not exist")
-        if timeout is not None:
-            old = handle.timeout
-            handle.timeout = timeout
-        try:
-            data = handle.read(n)
-        finally:
-            if timeout is not None:
-                handle.timeout = old
+        # Deliberately never touch handle.timeout here: reassigning a
+        # CDC-ACM serial.Serial's timeout attribute after construction was
+        # confirmed (by direct testing on macOS) to silently drop bytes
+        # already in flight, making reads time out even though the device
+        # had already replied within milliseconds. Poll instead, using the
+        # handle's fixed construction-time timeout for each underlying
+        # read() and tracking the caller's requested deadline ourselves.
+        deadline = time.time() + timeout if timeout is not None else None
+        data = b""
+        while len(data) < n:
+            data += handle.read(n - len(data))
+            if len(data) == n:
+                break
+            if deadline is not None and time.time() >= deadline:
+                break
         if len(data) != n:
             return None
         return data

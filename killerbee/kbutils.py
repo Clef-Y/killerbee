@@ -7,6 +7,7 @@ import usb.core # type: ignore
 import usb.util # type: ignore
 
 import serial # type: ignore
+import serial.tools.list_ports # type: ignore
 import os
 import struct
 import glob
@@ -277,22 +278,38 @@ def devlist(vendor: Optional[Any]=None, product: Optional[Any]=None, gps: Option
 
     devlist: List[Any] = devlist_usb_v1x(vendor, product)
 
+    # TI's XDS110 debug probe (used by both the CC1352P7 and CC1354P10
+    # boards) always enumerates two USB CDC-ACM ports: the actual KillerBee
+    # UART, and the probe's own CMSIS-DAP/debug companion port, which never
+    # speaks any of the legacy protocols below. Identifying these by USB
+    # descriptor up front (rather than only by the fast CC1354P10/CC1352P7
+    # ping) lets us skip the slow legacy fallbacks - isgoodfetccspi() alone
+    # can burn ~20s per port retrying its apimote2 sync (attemptlimit=30)
+    # against a port that can never be a GoodFET device.
+    xds110_ports = set(
+        p.device for p in serial.tools.list_ports.comports()
+        if p.manufacturer == "Texas Instruments" and p.product and "XDS110" in p.product
+    )
+
     for serialdev in get_serial_ports(include=include):
+        is_xds110 = serialdev in xds110_ports
         if serialdev == gps_devstring:
             continue
-        elif (DEV_ENABLE_SL_NODETEST and issl_nodetest(serialdev)):
+        elif (not is_xds110 and DEV_ENABLE_SL_NODETEST and issl_nodetest(serialdev)):
             devlist.append([serialdev, "Silabs NodeTest", ""])
-        elif (DEV_ENABLE_SL_BEEHIVE and issl_beehive(serialdev)):
+        elif (not is_xds110 and DEV_ENABLE_SL_BEEHIVE and issl_beehive(serialdev)):
             devlist.append([serialdev, "BeeHive SG", ""])
         elif (DEV_ENABLE_CC1354P10 and iscc1354p10(serialdev)):
             devlist.append([serialdev, "TI CC1354P10", ""])
         elif (DEV_ENABLE_CC1352P7 and iscc1352p7(serialdev)):
             devlist.append([serialdev, "TI CC1352P7", ""])
-        elif (DEV_ENABLE_ZIGDUINO and iszigduino(serialdev)):
+        elif (not is_xds110 and DEV_ENABLE_ZIGDUINO and iszigduino(serialdev)):
             devlist.append([serialdev, "Zigduino", ""])
-        elif (DEV_ENABLE_FREAKDUINO and isfreakduino(serialdev)):
+        elif (not is_xds110 and DEV_ENABLE_FREAKDUINO and isfreakduino(serialdev)):
             #TODO maybe move support for freakduino into goodfetccspi subtype==?
             devlist.append([serialdev, "Dartmouth Freakduino", ""])
+        elif is_xds110:
+            pass  # confirmed XDS110 debug companion port, not a KillerBee UART
         else:
             gfccspi,subtype = isgoodfetccspi(serialdev)
             if gfccspi and subtype == 0:
@@ -337,7 +354,18 @@ def get_serial_ports(include: Optional[Any]=None) -> Any:
         by the normal search. This may be useful if we're not including some
         oddly named serial port which you have a KillerBee device on. Optional.
     '''
-    seriallist = glob.glob("/dev/ttyUSB*") + glob.glob("/dev/tty.usbserial*") + glob.glob("/dev/ttyACM*") #TODO make cross platform globing/winnt
+    seriallist = (glob.glob("/dev/ttyUSB*") + glob.glob("/dev/tty.usbserial*")
+                  + glob.glob("/dev/ttyACM*")
+                  # macOS names native USB CDC-ACM ports (what the CC1352P7/
+                  # CC1354P10 XDS110 backchannel enumerates as) "usbmodem",
+                  # not "usbserial" (that's the FTDI-chip naming, already
+                  # covered above) or "ttyACM" (Linux-only) - neither
+                  # existing pattern ever matched these devices on macOS.
+                  # Only glob cu.* (not tty.* too) - both nodes point at the
+                  # same physical port, and probing a device twice under two
+                  # paths is what caused the second probe to fail outright.
+                  + glob.glob("/dev/cu.usbmodem*")
+                  ) #TODO make cross platform globing/winnt    
     if include is not None:
         seriallist = list( set(seriallist).union(set(filter(isSerialDeviceString, include))) )
     return seriallist
@@ -492,6 +520,14 @@ def iscc1354p10(serialdev: str) -> bool:
     try:
         time.sleep(0.2)  # let USB CDC-ACM enumeration and firmware settle
         s.reset_input_buffer()
+        # reset_input_buffer() alone isn't enough: macOS's CDC-ACM driver can
+        # still be delivering a previous probe's leftover response bytes
+        # (already in flight over USB when the flush ran) if this port was
+        # just closed and reopened by another probe a moment ago. Actively
+        # drain until genuinely empty so we don't mistake stale bytes for
+        # this ping's reply.
+        while s.read(64):
+            pass
         s.write(bytes([0xA5, 0x01, 0x00]))  # KB_SOF, CMD_PING, LEN=0
         sof = s.read(1)
         if sof != b'\xA5':
@@ -524,6 +560,14 @@ def iscc1352p7(serialdev: str) -> bool:
     try:
         time.sleep(0.2)  # let USB CDC-ACM enumeration and firmware settle
         s.reset_input_buffer()
+        # reset_input_buffer() alone isn't enough: macOS's CDC-ACM driver can
+        # still be delivering a previous probe's leftover response bytes
+        # (already in flight over USB when the flush ran) if this port was
+        # just closed and reopened by another probe a moment ago. Actively
+        # drain until genuinely empty so we don't mistake stale bytes for
+        # this ping's reply.
+        while s.read(64):
+            pass
         s.write(bytes([0xA5, 0x01, 0x00]))  # KB_SOF, CMD_PING, LEN=0
         sof = s.read(1)
         if sof != b'\xA5':
