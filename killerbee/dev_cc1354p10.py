@@ -46,19 +46,26 @@ Wire protocol (921600 8N1):
                          RX operation (i.e. SNIFFER_ON already sent) or it
                          returns TI's own documented error sentinel,
                          RF_GET_RSSI_ERROR_VAL = -128 (see RFCC26X2.h).
-  CMD_JAM_HOP_ON   0x0C  payload=[dwell_ms lo][dwell_ms hi][count]
-                         [page0][ch0]...[page(count-1)][ch(count-1)]
-                         -> reply [status]. Sub-1GHz only - each pair must
-                         be (31, channel<=128) or (28, channel<=65).
-                         Starts a constant-carrier jam that hops across
-                         the given *cross-page* channel list entirely
-                         on-chip - no host round-trip per hop, unlike
-                         driving the same rotation via repeated
-                         CMD_SET_CHANNEL calls. Each hop is a [page][ch]
-                         pair, not a bare channel, since page 31 and page
-                         28 use different frequency formulas at the same
-                         raw channel number. Stopped with the existing
-                         CMD_JAMMER_OFF. See main.c's "stage 6" comment.
+  CMD_JAM_HOP_ON   0x0C  payload=[dwell_ms lo][dwell_ms hi][rangeCount]
+                         [page0][chStart0][chEnd0]...
+                         [page(n-1)][chStart(n-1)][chEnd(n-1)]
+                         -> reply [status]. Sub-1GHz only - each range
+                         must be (31, 0<=start<=end<=128) or
+                         (28, 0<=start<=end<=65). Starts a constant-carrier
+                         jam that hops across the given *cross-page*
+                         channel *range* list entirely on-chip - no host
+                         round-trip per hop, unlike driving the same
+                         rotation via repeated CMD_SET_CHANNEL calls. Each
+                         entry is an inclusive [page][chStart][chEnd]
+                         range, not a bare channel: page 31/28 use
+                         different frequency formulas at the same raw
+                         channel number (so a bare channel span would be
+                         ambiguous), and ranges (not one entry per
+                         channel) are what let a large contiguous request
+                         (e.g. 120 channels) fit this command's payload at
+                         all - see jam_hop_on()'s _collapse_to_ranges().
+                         Stopped with the existing CMD_JAMMER_OFF. See
+                         main.c's "stage 6" comment.
 
   Async packet (CMD 0x90) payload:
       [rssi int8][crc_ok uint8][timestamp uint32 LE][framelen uint8][frame...]
@@ -101,7 +108,7 @@ CMD_ASYNC_PACKET: int = 0x90
 
 JAM_MODE_CONSTANT: int = 0x00
 JAM_MODE_REFLEXIVE: int = 0x01
-MAX_HOP_CHANNELS: int = 32  # matches firmware's MAX_HOP_CHANNELS
+MAX_HOP_RANGES: int = 32  # matches firmware's MAX_HOP_RANGES
 
 STATUS_OK: int = 0x00
 
@@ -432,6 +439,36 @@ class CC1354P10:
     def jammer_off(self) -> None:
         self.__command(CMD_JAMMER_OFF)
 
+    @staticmethod
+    def _collapse_to_ranges(hops: List[Tuple[int, int]]) -> List[Tuple[int, int, int]]:
+        '''
+        Collapses a flat (page, channel) hop list into (page, chStart,
+        chEnd) inclusive ranges wherever consecutive entries share the
+        same page and increment by exactly 1. A scattered, non-contiguous
+        entry just becomes its own length-1 range (chStart == chEnd) -
+        this never loses hop order or any entry, it only shrinks the wire
+        payload. Exists because the firmware's wire payload is capped at
+        255 bytes total (a single-byte LEN field) - an explicit
+        [page][channel] pair per hop caps out around ~126 hops, but two
+        real, useful requests (e.g. page 31 channels 9-128 + page 28
+        channels 9-65 = 177 channels) are common and are each a single
+        contiguous run, so encoding them as ranges (3 bytes each,
+        regardless of span) sidesteps the ceiling entirely.
+        '''
+        if not hops:
+            return []
+        ranges: List[Tuple[int, int, int]] = []
+        curPage, start = hops[0]
+        end = start
+        for page, ch in hops[1:]:
+            if page == curPage and ch == end + 1:
+                end = ch
+            else:
+                ranges.append((curPage, start, end))
+                curPage, start, end = page, ch, ch
+        ranges.append((curPage, start, end))
+        return ranges
+
     def jam_hop_on(self, hops: List[Tuple[int, int]], dwell_ms: int) -> None:
         '''
         Starts a constant-carrier jam that hops across the given
@@ -447,13 +484,17 @@ class CC1354P10:
             (page 0) is not supported by this on-chip hop command on this
             firmware. Each entry carries its own page (not a bare
             channel) since page 31 and page 28 use different frequency
-            formulas at the same raw channel number.
+            formulas at the same raw channel number. Internally collapsed
+            into contiguous (page, start, end) ranges before sending -
+            see _collapse_to_ranges() - so there is no small, fixed cap on
+            len(hops) itself; a large contiguous request (e.g. 9-128)
+            costs the same 3 wire bytes as a single channel.
         @param dwell_ms: milliseconds to jam each channel before hopping to
             the next (1-65535).
         '''
         self.capabilities.require(KBCapabilities.PHYJAM_HOP)
-        if not hops or len(hops) > MAX_HOP_CHANNELS:
-            raise Exception('hops must be 1-%d (page, channel) tuples' % MAX_HOP_CHANNELS)
+        if not hops:
+            raise Exception('hops must be a non-empty list of (page, channel) tuples')
         for page, ch in hops:
             okPair = (page == 31 and 0 <= ch <= 128) or (page == 28 and 0 <= ch <= 65)
             if not okPair:
@@ -463,9 +504,15 @@ class CC1354P10:
         if dwell_ms < 1 or dwell_ms > 0xFFFF:
             raise Exception('dwell_ms must be 1-65535')
 
-        payload = struct.pack('<HB', dwell_ms, len(hops))
-        for page, ch in hops:
-            payload += bytes([page, ch])
+        ranges = self._collapse_to_ranges(hops)
+        if len(ranges) > MAX_HOP_RANGES:
+            raise Exception('hops collapses to %d contiguous ranges, more than the '
+                             'firmware supports (%d) - it needs %d non-contiguous runs; '
+                             'try fewer distinct/scattered spans' % (len(ranges), MAX_HOP_RANGES, len(ranges)))
+
+        payload = struct.pack('<HB', dwell_ms, len(ranges))
+        for page, chStart, chEnd in ranges:
+            payload += bytes([page, chStart, chEnd])
         status = self.__command(CMD_JAM_HOP_ON, payload)
         if status[0] != STATUS_OK:
             raise Exception("Device rejected jam_hop_on()")

@@ -57,8 +57,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from subg_jam import parse_page_channels  # reuse, don't duplicate
 from subg_scan import PAGE_INFO  # reuse, don't duplicate
 
-MAX_HOP_CHANNELS = 32  # matches firmware's MAX_HOP_CHANNELS
-
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
@@ -84,10 +82,11 @@ def main() -> None:
     args = ap.parse_args()
 
     hops = parse_page_channels(args.page_channels)  # exits with an error message on anything invalid
-    if len(hops) > MAX_HOP_CHANNELS:
-        print("error: too many hops (%d given, max %d)" % (len(hops), MAX_HOP_CHANNELS),
-              file=sys.stderr)
-        sys.exit(1)
+    # No flat-count cap here: dev_cc1354p10.jam_hop_on() collapses this
+    # list into contiguous (page, start, end) ranges before sending, so a
+    # large contiguous span (e.g. 9-128) costs the same 3 wire bytes as a
+    # single channel - it raises its own clear error if the *collapsed*
+    # range count is still too large (many scattered, non-contiguous runs).
 
     dwell_ms = round(args.dwell * 1000)
     if dwell_ms < 1 or dwell_ms > 0xFFFF:

@@ -599,16 +599,35 @@ firmware's README for the ~30ms-per-host-round-trip measurement that
 motivates this) - **deliberately not offered on 2.4GHz/page 0 on this
 firmware**, sub-1GHz only.
 
-**Each hop entry is a `[page][channel]` pair, not a bare channel** -
-`payload = [dwell_ms lo][dwell_ms hi][count][page0][ch0]...[page(n-1)][ch(n-1)]`,
-each pair either `(31, channel<=128)` or `(28, channel<=65)`. This is the
-one real design difference from the CC1352P7 version: that firmware's hop
-list is single-band (2.4GHz only, so a bare channel is unambiguous), but
-here page 31 and page 28 share the exact same `BAND_SUBG` radio setup
-while using *different* `rfTuneToChannel()` frequency formulas at the same
-raw channel number (channel 20 is valid on both pages, at very different
-real frequencies: 906.2 MHz on page 31, 867.0 MHz on page 28) - a bare
-channel number would be ambiguous.
+**Each hop entry is an inclusive `[page][chStart][chEnd]` range, not a
+bare channel** - `payload = [dwell_ms lo][dwell_ms hi][rangeCount]
+[page0][chStart0][chEnd0]...[page(n-1)][chStart(n-1)][chEnd(n-1)]`, each
+range either `(31, 0<=start<=end<=128)` or `(28, 0<=start<=end<=65)`. Two
+real design differences from the CC1352P7 version:
+
+1. **Ranges, not one entry per channel.** The outer wire protocol's
+   single-byte payload `LEN` field caps any command's payload at 255
+   bytes - a 3-byte header plus 2 bytes per explicit `[page][channel]`
+   hop (the very first version of this command) tops out around ~126
+   hops. A real, useful request - e.g. page 31 channels 9-128 plus page
+   28 channels 9-65, 177 channels total - genuinely exceeds that with an
+   explicit list, but both spans are contiguous, so encoding each as one
+   `[page][chStart][chEnd]` range (3 bytes, regardless of how many
+   channels it spans) sidesteps the ceiling entirely. A scattered,
+   non-contiguous request still works fine - it just becomes several
+   length-1 ranges (`chStart == chEnd`), at the same per-entry cost as
+   the old explicit-list format. `dev_cc1354p10.py`'s `jam_hop_on()`
+   does this collapsing (`_collapse_to_ranges()`) on the host side before
+   sending - the firmware only ever sees already-collapsed ranges, and
+   `tools/subg_jam_hop.py` needed no changes at all to gain this.
+2. **Each range carries its own page, not a bare channel span** - page 31
+   and page 28 share the exact same `BAND_SUBG` radio setup while using
+   *different* `rfTuneToChannel()` frequency formulas at the same raw
+   channel number (channel 20 is valid on both pages, at very different
+   real frequencies: 906.2 MHz on page 31, 867.0 MHz on page 28), so a
+   bare channel span would be ambiguous - same reasoning as the
+   CC1352P7 version's single-page `[page][channel]` pairs, just extended
+   to a range's start/end.
 
 **A real bug this surfaced and fixed:** `rfTuneToChannel()`'s tune cache
 (`lastTuneValid`/`lastTunedChannel`) only ever compared the raw channel
@@ -625,33 +644,49 @@ CC1352P7 firmware) never updated the shared `channel` global, so
 `GET_CHANNEL` issued mid-hop reported a stale channel from before hopping
 started even though `currentPage` was correct - now updated on every hop.
 
-Python: `kb.jam_hop_on([(31, 9), (31, 14), (28, 10), ...], dwell_ms=20)`,
-stop with `kb.jammer_off()` - the same command that stops every other jam
-mode. CLI: `tools/subg_jam_hop.py`, using the same `--page-channels
-PAGE:CHANNELS` syntax as `tools/subg_jam.py`'s cross-page host-driven
-version:
+Python: `kb.jam_hop_on([(31, 9), (31, 14), (28, 10), ...], dwell_ms=20)` -
+a flat `(page, channel)` list, same shape as before; `jam_hop_on()`
+collapses it into ranges internally. Stop with `kb.jammer_off()` - the
+same command that stops every other jam mode. CLI: `tools/subg_jam_hop.py`,
+using the same `--page-channels PAGE:CHANNELS` syntax as
+`tools/subg_jam.py`'s cross-page host-driven version (channel specs
+accept `-` ranges, e.g. `9-128`):
 
 ```sh
 python3 tools/subg_jam_hop.py -i /dev/cu.usbmodemLS4501DC1 --dwell 0.02 \
     --page-channels 31:9,14,15,19,20,24,106 \
     --page-channels 28:10,12,20,41,51,57
+
+# A large contiguous request - 177 channels total, collapses to just 2
+# wire-protocol ranges (2 * 3 = 6 payload bytes), impossible to express
+# as an explicit per-channel list under the 255-byte payload ceiling:
+python3 tools/subg_jam_hop.py -i /dev/cu.usbmodemLS4501DC1 --dwell 0.02 \
+    --page-channels 31:9-128 \
+    --page-channels 28:9-65
 ```
 
 **Hardware-validated with real RF evidence, not just command-level
-success.** Command-level: `JAM_HOP_ON` accepted for a valid 13-entry
-cross-page list, device stays fully responsive to `PING`/`GET_CHANNEL`
-while hopping (`GET_CHANNEL` mid-hop correctly reported a real
-in-progress channel/page pair from the list, e.g. channel 51/page 28),
-`JAMMER_OFF` stops it cleanly, and all three invalid-payload cases
-(page 0, out-of-range channel for page 28, out-of-range channel for page
-31) correctly rejected with `STATUS_ERROR`. Beyond that: verified with an
-independent RF energy check using a second board (CC1352P7, which also
-supports page 31 - though not page 28) doing ambient RSSI sampling
-(`GET_RSSI` while sniffing) on each page-31 target channel while this one
-hopped the full cross-page list at 20ms dwell - every page-31 channel in
-the list showed a clear spike (~-77 to -87 dBm) against a much quieter
-~-105 to -119 dBm baseline on channels *not* in the list, confirming real,
-on-air hopping (the page-28 portion isn't independently RF-verifiable this
+success.** Command-level: `JAM_HOP_ON` accepted for both a 13-entry
+scattered cross-page list and the 177-channel/2-range contiguous request
+above, device stays fully responsive to `PING`/`GET_CHANNEL` while hopping
+(`GET_CHANNEL` mid-hop correctly reported real in-progress channel/page
+values from the requested span, including the exact boundary channel 128
+on page 31, confirmed with a deterministic single-channel-range hop, not
+just statistical sampling luck), `JAMMER_OFF` stops it cleanly, and all
+three invalid-payload cases (page 0, out-of-range channel for page 28,
+out-of-range channel for page 31) correctly rejected with `STATUS_ERROR`.
+Also verified the 177-channel run's `GET_CHANNEL` samples span almost the
+entire requested range on both pages (page 28: the full 9-65; page 31:
+9-127 directly sampled, 128 confirmed separately as above) over repeated
+polling across a full ~3.5s hop cycle, ruling out silent truncation.
+Beyond that: verified with an independent RF energy check using a second
+board (CC1352P7, which also supports page 31 - though not page 28) doing
+ambient RSSI sampling (`GET_RSSI` while sniffing) on each page-31 target
+channel while this one hopped the (13-entry) cross-page list at 20ms
+dwell - every page-31 channel in the list showed a clear spike (~-77 to
+-87 dBm) against a much quieter ~-105 to -119 dBm baseline on channels
+*not* in the list, confirming real, on-air hopping (the page-28 portion
+isn't independently RF-verifiable this
 way since no second board here can tune there, but the same
 `rfTuneToChannel()`/`rfJamStart()` code path already validated for page 28
 elsewhere, plus the `GET_CHANNEL` mid-hop evidence above, cover it).
@@ -680,7 +715,7 @@ Device -> Host:  [0xA5][CMD|0x80] [LEN][LEN bytes payload]   (reply to CMD)
 | 0x09 | SET_SELFACK      | `[enable]`                                      | `[status]` |
 | 0x0A | RESET            | —                                                | `[status]` |
 | 0x0B | GET_RSSI         | —                                                | `[rssi int8]` |
-| 0x0C | JAM_HOP_ON       | `[dwell_ms lo][dwell_ms hi][count][page0][ch0]...[page(n-1)][ch(n-1)]` (sub-1GHz only: each pair (31, ch<=128) or (28, ch<=65)) | `[status]` |
+| 0x0C | JAM_HOP_ON       | `[dwell_ms lo][dwell_ms hi][rangeCount][page0][chStart0][chEnd0]...[page(n-1)][chStart(n-1)][chEnd(n-1)]` (sub-1GHz only: each range (31, 0<=start<=end<=128) or (28, 0<=start<=end<=65)) | `[status]` |
 | 0x90 | (async) PACKET   | n/a — device-initiated                          | `[rssi int8][crc_ok u8][timestamp u32 LE][framelen u8][frame...]` |
 
 `status`: `0x00` = OK, `0x01` = ERROR. `frame` is the PSDU including the
