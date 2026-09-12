@@ -25,11 +25,13 @@ Wire protocol (921600 8N1):
                          Rate Mode 0 (channel 0-128, 902.2 + 0.2*channel
                          MHz - the real standard channel plan, verified
                          against TI's own ti154stack); page 28 = 863-876MHz
-                         EU/UK SUN O-QPSK Rate Mode 0 (channel 0-26, 863.0 +
-                         0.5*channel MHz - a project-local channel plan, see
-                         main.c's "stage 5"/"Page 28 support" comments for
-                         why - switches the RF core's radio setup at
-                         runtime, see main.c's "stage 4" comment.
+                         EU/UK SUN O-QPSK Rate Mode 0 (channel 0-65, 863.0 +
+                         0.2*channel MHz - same 0.2MHz channel spacing as
+                         page 31, for finer scan resolution; a project-local
+                         channel plan otherwise, see main.c's "stage
+                         5"/"Page 28 support" comments for why - switches
+                         the RF core's radio setup at runtime, see main.c's
+                         "stage 4" comment.
   CMD_SNIFFER_ON   0x04  -> reply [status]
   CMD_SNIFFER_OFF  0x05  -> reply [status]
   CMD_INJECT       0x06  payload=[count][delay_ms lo][delay_ms hi][frame...]
@@ -136,8 +138,9 @@ class CC1354P10:
         # switches to at runtime - see firmware/src/kb-cc1354p10/main.c's
         # "stage 4" header comment.
         self.capabilities.setcapab(KBCapabilities.FREQ_915, True)
-        # 863-876 MHz EU/UK, channels 0-26 (863.0 + 0.5*channel MHz - a
-        # project-local channel plan, NOT the same as KBCapabilities'
+        # 863-876 MHz EU/UK, channels 0-65 (863.0 + 0.2*channel MHz, the
+        # same 0.2MHz spacing page 31 uses at 915MHz - a project-local
+        # channel plan, NOT the same as KBCapabilities'
         # generic page-28 frequency() formula, which was written for older
         # Silabs hardware's narrower 863-868 MHz sub-band; kb.frequency()
         # will report the wrong frequency for this device on page 28, same
@@ -145,6 +148,18 @@ class CC1354P10:
         # see firmware/src/kb-cc1354p10/main.c's "stage 5"/README.md's
         # "Page 28 support" section.
         self.capabilities.setcapab(KBCapabilities.FREQ_863, True)
+        # Also advertise the wider range explicitly: KBCapabilities.
+        # is_valid_channel()'s page-28 case can't just raise its shared
+        # upper bound to 65 for every FREQ_863 device (see
+        # FREQ_863_WIDE's docstring in kbutils.py - some page-28 hardware
+        # packs the channel into a 5-bit field and would silently corrupt
+        # above channel 31), so this device needs its own, distinct flag
+        # to unlock KillerBee.set_channel()'s full 0-65 range at the
+        # generic capabilities-check layer (dev_cc1354p10.set_channel()'s
+        # own range check was already correct - this fixes the *caller's*
+        # pre-check in killerbee/__init__.py, which runs first and would
+        # otherwise reject channels 27-65 before this driver ever sees them).
+        self.capabilities.setcapab(KBCapabilities.FREQ_863_WIDE, True)
 
         self.capabilities.setcapab(KBCapabilities.SNIFF, True)
         self.capabilities.setcapab(KBCapabilities.SETCHAN, True)
@@ -287,10 +302,10 @@ class CC1354P10:
                                  'ti154stack; see firmware/src/kb-cc1354p10/README.md)')
         elif page == 28:
             self.capabilities.require(KBCapabilities.FREQ_863)
-            if channel < 0 or channel > 26:
-                raise Exception('Invalid channel (must be 0-26 for the 863-876 MHz EU/UK '
+            if channel < 0 or channel > 65:
+                raise Exception('Invalid channel (must be 0-65 for the 863-876 MHz EU/UK '
                                  'band - a project-local channel plan specific to this '
-                                 'firmware, 863.0 + 0.5*channel MHz, NOT the same as '
+                                 'firmware, 863.0 + 0.2*channel MHz, NOT the same as '
                                  'KBCapabilities\' generic page-28 frequency() formula; '
                                  'see firmware/src/kb-cc1354p10/README.md\'s "Page 28 '
                                  'support" section)')

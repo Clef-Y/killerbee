@@ -37,7 +37,7 @@ below.
 | KBCapabilities   | Supported | Notes |
 |------------------|-----------|-------|
 | SNIFF            | yes       | Promiscuous `CMD_IEEE_RX` (2.4GHz) / `CMD_PROP_RX` (915MHz), frame filtering off by default |
-| SETCHAN          | yes       | Channels 11-26 (2.4 GHz, page 0), 0-128 (915 MHz US ISM, page 31), and 0-26 (863-876 MHz EU/UK, page 28 - CC1354P10 only) |
+| SETCHAN          | yes       | Channels 11-26 (2.4 GHz, page 0), 0-128 (915 MHz US ISM, page 31), and 0-65 (863-876 MHz EU/UK, page 28 - CC1354P10 only) |
 | INJECT           | yes       | `CMD_IEEE_TX` (2.4GHz) / `CMD_PROP_TX` (sub-1GHz, both pages), hardware auto-computes/appends the FCS |
 | SELFACK          | yes*      | Extra `driver.set_selfack()` method — see caveat below; no generic KillerBee-level setter exists in this codebase for any device. Both bands - hardware auto-ACK on 2.4GHz, software reflex on sub-1GHz (no hardware ACK support in `CMD_PROP_RX` - see "Sub-1GHz support") |
 | PHYJAM           | yes       | Continuous `CMD_TX_TEST` (modulated PRBS-15 garbage) - PHY-agnostic, works on either band |
@@ -45,7 +45,7 @@ below.
 | SET_SYNC         | no        | The native IEEE 802.15.4 RX/TX commands use a fixed, standard O-QPSK preamble/SFD; there is no register here to reprogram it (unlike CC2420-style radios) |
 | FREQ_2400        | yes       | |
 | FREQ_915         | yes       | 915 MHz US ISM, channels 0-128 - see "Sub-1GHz support" below |
-| FREQ_863         | yes       | 863-876 MHz EU/UK, channels 0-26, CC1354P10 only - see "Page 28 support" below. Project-local channel plan, does not match `kbutils.py`'s existing generic page-28 formula (written for older Silabs hardware) - see that section for why |
+| FREQ_863         | yes       | 863-876 MHz EU/UK, channels 0-65, CC1354P10 only - see "Page 28 support" below. Project-local channel plan, does not match `kbutils.py`'s existing generic page-28 formula (written for older Silabs hardware) - see that section for why |
 | FREQ_900/868/870 | no        | Not configured in this firmware |
 | BOOT             | no        | No bootloader protocol exposed over this UART; reflash via the debug probe (see below) |
 
@@ -521,7 +521,7 @@ working fix (reduced sub-1GHz TX power) that followed from the diagnosis.
   firmware-side mitigation for a hardware power-delivery limitation, not a
   fix to the underlying limitation itself.
 
-## Page 28 support (863-876 MHz EU/UK, channels 0-26, CC1354P10 only)
+## Page 28 support (863-876 MHz EU/UK, channels 0-65, CC1354P10 only)
 
 Added as `stage 5` (see the file header comment). Reuses the exact same
 SUN O-QPSK Rate Mode 0 radio setup as page 31 above - no new
@@ -531,31 +531,45 @@ picks a different frequency formula based on `currentPage`. Deliberately
 **CC1354P10-only**, not added to the CC1352P7 firmware or to the generic
 `KBCapabilities`/`kbutils.py` page-28 handling (see below for why).
 
-**Channel plan:** channel *n* (0-26) = `863.0 + 0.5*n` MHz, spanning
-863-876 MHz end to end with even 0.5 MHz spacing (channel 26 lands on
-exactly 876.0 MHz). This is a **project-local** channel numbering, not a
-real external standard's - unlike page 31's plan (which mirrors TI's own
-SUN/802.15.4g 915 MHz numbering exactly), no single standard channel plan
-covers this specific 863-876 MHz span with exactly 27 channels, so this
-firmware picked a clean, full-range, evenly-spaced sweep instead of trying
-to match one.
+**Channel plan:** channel *n* (0-65) = `863.0 + 0.2*n` MHz, 66 channels
+spanning 863-876 MHz end to end (channel 65 lands on exactly 876.0 MHz).
+Deliberately reuses page 31's exact 0.2 MHz channel spacing - TI's own
+real SUN O-QPSK Rate Mode 0 spacing at 915 MHz, not an arbitrary choice -
+for finer frequency resolution and more accurate scanning than an earlier
+version of this same page, which used a coarser 27-channel/0.5 MHz plan
+(see git history). Channel *numbering* is still **project-local**, not a
+real external standard's - unlike page 31's plan (which also mirrors TI's
+own SUN/802.15.4g channel count for its band), no single standard channel
+plan covers this specific 863-876 MHz span with exactly 66 channels, so
+this firmware picked a clean, full-range sweep at the same resolution
+instead of trying to match one.
 
 **Deliberately does not match `killerbee/kbutils.py`'s existing, generic
-page-28 `KBCapabilities.frequency()`/`is_valid_channel()` handling.** That
-generic helper already had a page-28 case before this firmware existed -
-written for older Silabs hardware (`dev_sl_beehive.py`/`dev_sl_nodetest.py`,
-both real `FREQ_863`-capable devices), with its own different formula
-(`863.25 + 0.2*ch` MHz, upper-bounded the same channel range but a
-narrower ~5.2 MHz actual span). Changing that shared helper to match this
-firmware's wider 863-876 MHz plan would have silently changed frequency
-reporting for that unrelated hardware too. So this firmware's page 28
-support is entirely self-contained in `dev_cc1354p10.py`'s own
-`set_channel()` range check (`channel <= 26`, gated on `FREQ_863`) and this
-file's `rfTuneToChannel()` - it does not call or share
-`KBCapabilities.frequency()`/`is_valid_channel()` at all, exactly like page
-31 already didn't. `kb.frequency(channel, page=28)` will report the wrong
-(Silabs) frequency for this device, same caveat as page 31's `frequency()`
-divergence above.
+page-28 `KBCapabilities.frequency()` formula.** That generic helper already
+had a page-28 case before this firmware existed - written for older
+Silabs hardware (`dev_sl_beehive.py`/`dev_sl_nodetest.py`, both real
+`FREQ_863`-capable devices), with its own different formula (`863.25 +
+0.2*ch` MHz, spanning only ~5.2 MHz). `kb.frequency(channel, page=28)`
+will still report the wrong (Silabs) frequency for this device, same
+caveat as page 31's `frequency()` divergence above - `rfTuneToChannel()`
+does not call or share it at all.
+
+**`is_valid_channel()` needed a real fix, not just a bypass, once this
+went from 27 to 66 channels.** `KillerBee.set_channel()` (the top-level
+method every tool actually calls, not `driver.set_channel()` directly)
+gates every call through `KBCapabilities.is_valid_channel()` *before* the
+driver ever sees it - discovered the hard way when `subg_scan.py -p 28`
+hit channel 27 and got rejected with `ValueError` despite
+`dev_cc1354p10.py`'s own range check already correctly allowing 0-65.
+Simply raising `is_valid_channel()`'s shared page-28 upper bound from 26
+to 65 was **not** safe: `dev_sl_beehive.py`/`dev_sl_nodetest.py` pack the
+channel into a 5-bit protocol field (`channel & 0x1f`) and would silently
+*wrap*, not error, above channel 31 (channel 65 would send as channel 1).
+Fixed instead with a new, additive `KBCapabilities.FREQ_863_WIDE` flag -
+only this firmware sets it, `is_valid_channel()`'s page-28 case checks it
+first and allows 0-65 only when set, otherwise falls back to the original
+`FREQ_863`/channel-26 bound unchanged. Zero behavior change for existing
+`FREQ_863` hardware.
 
 **Same band-switch cost/risk as page 0<->31** - switching between page 0
 (2.4 GHz) and page 28 tears down and rebuilds the RF driver connection
@@ -587,7 +601,7 @@ Device -> Host:  [0xA5][CMD|0x80] [LEN][LEN bytes payload]   (reply to CMD)
 |------|------------------|------------------------------------------------|---------------|
 | 0x01 | PING             | —                                                | ASCII firmware ID, e.g. `KB-CC1354P10 v1.0` |
 | 0x02 | GET_CHANNEL      | —                                                | `[channel][page]` |
-| 0x03 | SET_CHANNEL      | `[channel]` or `[channel][page]` (page 0: 11-26, page 31: 0-128, page 28: 0-26) | `[status]` |
+| 0x03 | SET_CHANNEL      | `[channel]` or `[channel][page]` (page 0: 11-26, page 31: 0-128, page 28: 0-65) | `[status]` |
 | 0x04 | SNIFFER_ON       | —                                                | `[status]` |
 | 0x05 | SNIFFER_OFF      | —                                                | `[status]` |
 | 0x06 | INJECT           | `[count][delay_ms lo][delay_ms hi][frame...]`   | `[status]` |

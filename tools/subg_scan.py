@@ -2,7 +2,7 @@
 """
 subg_scan.py - Sub-1GHz channel scanner for KillerBee's CC1354P10 driver.
 Supports two bands via -p/--page: page 31 (default) = 915 MHz US ISM,
-channels 0-128; page 28 = 863-876 MHz EU/UK, channels 0-26 (CC1354P10
+channels 0-128; page 28 = 863-876 MHz EU/UK, channels 0-65 (CC1354P10
 only - see firmware/src/kb-cc1354p10/README.md's "Page 28 support"
 section).
 
@@ -38,8 +38,8 @@ Examples:
     # Full real channel plan (0-128, 129 channels - long at any real dwell)
     python3 tools/subg_scan.py -c 0-128
 
-    # Page 28: 863-876 MHz EU/UK, channels 0-26, CC1354P10 only
-    python3 tools/subg_scan.py -p 28 -c 0-26 -t 60
+    # Page 28: 863-876 MHz EU/UK, channels 0-65, CC1354P10 only
+    python3 tools/subg_scan.py -p 28 -c 0-65 -t 60
 
     # Custom device and output directory
     python3 tools/subg_scan.py -i /dev/ttyACM0 -o /tmp/myscan
@@ -73,17 +73,17 @@ from killerbee import KillerBee, KBCapabilities, PcapDumper, DLT_IEEE802_15_4  #
 # from kbutils.py) - documented, deliberate divergence.
 FREQ_MHZ_PAGE31 = {ch: round(902.2 + 0.2 * ch, 1) for ch in range(0, 129)}
 
-# Page 28 (CC1354P10 only): 863-876 MHz EU/UK, channels 0-26, 863.0 +
-# 0.5*channel MHz - a project-local channel plan (no single real standard
-# covers this exact span/channel count), see
+# Page 28 (CC1354P10 only): 863-876 MHz EU/UK, channels 0-65 (66 channels),
+# 863.0 + 0.2*channel MHz - same 0.2MHz channel spacing as page 31's real
+# TI SUN O-QPSK Rate Mode 0 plan at 915MHz, for finer scan resolution; see
 # firmware/src/kb-cc1354p10/README.md's "Page 28 support" section.
-FREQ_MHZ_PAGE28 = {ch: round(863.0 + 0.5 * ch, 1) for ch in range(0, 27)}
+FREQ_MHZ_PAGE28 = {ch: round(863.0 + 0.2 * ch, 1) for ch in range(0, 66)}
 
 PAGE_INFO = {
     31: {"freq_mhz": FREQ_MHZ_PAGE31, "max_channel": 128,
          "capability": KBCapabilities.FREQ_915, "band_name": "915 MHz US ISM"},
-    28: {"freq_mhz": FREQ_MHZ_PAGE28, "max_channel": 26,
-         "capability": KBCapabilities.FREQ_863, "band_name": "863-876 MHz EU/UK"},
+    28: {"freq_mhz": FREQ_MHZ_PAGE28, "max_channel": 65,
+         "capability": KBCapabilities.FREQ_863_WIDE, "band_name": "863-876 MHz EU/UK"},
 }
 
 # Back-compat alias: tools/subg_track.py (page-31-only, not extended to
@@ -353,7 +353,7 @@ def main() -> None:
                           "(default: 0-9)")
     ap.add_argument("-p", "--page", type=int, default=31, choices=(28, 31),
                      help="KillerBee page: 31 = 915 MHz US ISM, channels 0-128 "
-                          "(default); 28 = 863-876 MHz EU/UK, channels 0-26 "
+                          "(default); 28 = 863-876 MHz EU/UK, channels 0-65 "
                           "(CC1354P10 only)")
     ap.add_argument("-o", "--outdir", default=None,
                      help="Output directory (default: ./subg_scan_<timestamp>)")

@@ -44,8 +44,11 @@
  * hardware-validated.
  *
  * stage 5 (CC1354P10 only): + KillerBee page 28, the 863-876 MHz EU/UK SRD
- * band, channels 0-26 (863.0 + 0.5*ch MHz - a clean, evenly-spaced plan
- * covering the full 863-876 MHz range end to end; this is a project-local
+ * band, channels 0-65 (863.0 + 0.2*ch MHz, 66 channels - the same 0.2 MHz
+ * channel spacing TI's own SUN O-QPSK Rate Mode 0 plan already uses at
+ * 915 MHz (page 31), not an arbitrary choice, for finer frequency
+ * resolution/more accurate scanning than an earlier 27-channel/0.5 MHz
+ * version of this same page - see git history. This is a project-local
  * channel numbering, not the same as kbutils.py's generic FREQ_863
  * KBCapabilities.frequency() formula, which was written for older Silabs
  * hardware's narrower 863-868 MHz sub-band - see rfTuneToChannel()'s
@@ -228,7 +231,7 @@ static RF_CmdHandle sniffCmdHandle = RF_ALLOC_ERROR;
 /* BAND_24GHZ = native IEEE 802.15.4 (KillerBee page 0, channels 11-26).
  * BAND_SUBG = the SUN O-QPSK Rate Mode 0 radio setup, shared by both
  * KillerBee page 31 (915 MHz US ISM, channels 0-128) and page 28 (863-876
- * MHz EU/UK, channels 0-26, CC1354P10 only) - same PHY/radio setup for
+ * MHz EU/UK, channels 0-65, CC1354P10 only) - same PHY/radio setup for
  * both, currentPage picks which frequency formula rfTuneToChannel() uses.
  * See rfSwitchBand() for the RF_close()/RF_open() transition between
  * BAND_24GHZ and BAND_SUBG. */
@@ -595,13 +598,16 @@ static bool rfPostAndPoll(RF_Op *op, uint16_t okStatus)
  *
  * Page 28 (CC1354P10 only, 863-876 MHz EU/UK) reuses this exact same SUN
  * O-QPSK Rate Mode 0 radio setup - only the tuned frequency differs, via
- * a separate, evenly-spaced formula (863.0 + 0.5*ch MHz, channels 0-26,
+ * a separate formula (863.0 + 0.2*ch MHz, channels 0-65, 66 channels,
  * spanning the full 863-876 MHz range end to end): channel n -> 863.0 +
- * 0.5*n MHz. This is a project-local channel plan (unlike page 31's,
- * which mirrors a real TI/SUN standard channel numbering) since no single
- * standard channel plan covers this exact 863-876 MHz span; picked for a
- * clean, full-range sweep rather than matching any specific existing
- * device's numbering. */
+ * 0.2*n MHz. Deliberately reuses page 31's exact 0.2 MHz channel spacing
+ * (TI's own real SUN O-QPSK Rate Mode 0 spacing, not an arbitrary
+ * project choice) for the same frequency resolution/scan accuracy - an
+ * earlier version of this page used a coarser 0.5 MHz/27-channel plan,
+ * see git history. Still a project-local channel *numbering* (unlike page
+ * 31's, which also mirrors a real TI/SUN standard channel count for its
+ * band) since no single standard channel plan covers this exact 863-876
+ * MHz span with this channel count either. */
 static bool rfTuneToChannel(uint8_t ch)
 {
     if (lastTuneValid && ch == lastTunedChannel) {
@@ -614,7 +620,7 @@ static bool rfTuneToChannel(uint8_t ch)
          * change, not a hot loop) to mirror TI's own conversion exactly
          * rather than approximate it with integer rounding tricks. */
         double freqMHz = (currentPage == 28)
-                ? (863000.0 + 500.0 * (double)ch) / 1000.0
+                ? (863000.0 + 200.0 * (double)ch) / 1000.0
                 : (902200.0 + 200.0 * (double)ch) / 1000.0;
         double intPart = floor(freqMHz);
         double fractRaw = (freqMHz - intPart) * 65536.0;
@@ -962,7 +968,7 @@ static void handleCommand(uint8_t cmd, const uint8_t *payload, uint8_t len)
         /* payload = [channel] (legacy, always page 0/2.4GHz) or
          * [channel][page] (page 0 = 2.4GHz 11-26; page 31 = 915MHz SUN
          * O-QPSK 0-128, matching KillerBee's own FREQ_915 page number;
-         * page 28 = 863-876MHz EU/UK SUN O-QPSK 0-26, CC1354P10 only). */
+         * page 28 = 863-876MHz EU/UK SUN O-QPSK 0-65, CC1354P10 only). */
         if (len < 1 || len > 2) {
             sendStatus(cmd, STATUS_ERROR);
             break;
@@ -971,10 +977,11 @@ static void handleCommand(uint8_t cmd, const uint8_t *payload, uint8_t len)
         uint8_t newPage = (len == 2) ? payload[1] : 0;
         trace(TR_SET_CHANNEL_REQ, newPage);
         /* page 31 range is 0-128 (129 channels) - the real SUN O-QPSK
-         * Rate Mode 0 channel plan, see rfTuneToChannel()'s comment. */
+         * Rate Mode 0 channel plan; page 28 range is 0-65 (66 channels) -
+         * see rfTuneToChannel()'s comment for both. */
         bool validRange = (newPage == 0 && newChannel >= 11 && newChannel <= 26)
                         || (newPage == 31 && newChannel <= 128)
-                        || (newPage == 28 && newChannel <= 26);
+                        || (newPage == 28 && newChannel <= 65);
         if (!validRange) {
             sendStatus(cmd, STATUS_ERROR);
             break;

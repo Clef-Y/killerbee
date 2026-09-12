@@ -60,6 +60,7 @@ class KBCapabilities:
     FREQ_868: int      = 0x0c #: Capabilities Flag: Can perform 868-876 MHz sniffing (ch 0-8)
     FREQ_870: int      = 0x0d #: Capabilities Flag: Can perform 870-876 MHz sniffing (ch 0-26)
     FREQ_915: int      = 0x0e #: Capabilities Flag: Can perform 915-917 MHz sniffing (ch 0-26)
+    FREQ_863_WIDE: int = 0x0f #: Capabilities Flag: Can perform 863-876 MHz sniffing at finer resolution (page 28, ch 0-65). A distinct flag from FREQ_863, not a superset/alias of it - some page-28 hardware (e.g. dev_sl_beehive.py/dev_sl_nodetest.py) packs the channel into a 5-bit field (channel & 0x1f) and silently wraps/corrupts above channel 31, so is_valid_channel()'s page-28 upper bound can't simply be raised for every FREQ_863 device. Only set this on hardware verified to accept the full 0-65 range (currently: the CC1354P10 firmware's page 28 - see firmware/src/kb-cc1354p10/README.md's "Page 28 support" section).
 
     def __init__(self) -> None:
         self._capabilities: Dict[int, bool] = {
@@ -77,6 +78,7 @@ class KBCapabilities:
                 self.FREQ_868: False ,
                 self.FREQ_870: False,
                 self.FREQ_915: False,
+                self.FREQ_863_WIDE: False,
                 self.BOOT: False }
 
     def check(self, capab: int) -> bool:
@@ -142,8 +144,20 @@ class KBCapabilities:
 
         # if sub-ghz, check that page and channel and capability match
         if page:
-            if page == 28 and (channel > 26 or not self.check(self.FREQ_863)):
-                return False
+            if page == 28:
+                # FREQ_863_WIDE (currently: only the CC1354P10 firmware)
+                # gets the wider, finer-resolution 0-65 range; everything
+                # else - including page-28 hardware whose protocol packs
+                # the channel into a 5-bit field (e.g.
+                # dev_sl_beehive.py/dev_sl_nodetest.py, channel & 0x1f) and
+                # would silently wrap/corrupt above channel 31 - keeps the
+                # original, narrower 0-26 bound. See FREQ_863_WIDE's
+                # docstring for why this can't just be one raised bound.
+                if self.check(self.FREQ_863_WIDE):
+                    if channel > 65:
+                        return False
+                elif channel > 26 or not self.check(self.FREQ_863):
+                    return False
             if page == 29 and (channel > 8 or not self.check(self.FREQ_868)):
                 return False
             if page == 30 and (channel > 26 or not self.check(self.FREQ_870)):

@@ -3,7 +3,7 @@
 subg_jam.py - Rotating continuous-carrier jammer for specific sub-1GHz
 channels, using KillerBee's CC1354P10 driver. Supports two bands via
 -p/--page: page 31 (default) = 915 MHz US ISM, channels 0-128; page 28 =
-863-876 MHz EU/UK, channels 0-26 (CC1354P10 only - see
+863-876 MHz EU/UK, channels 0-65 (CC1354P10 only - see
 firmware/src/kb-cc1354p10/README.md's "Page 28 support" section).
 
 Starts constant-carrier PHY jamming (KBCapabilities.PHYJAM - modulated
@@ -33,7 +33,7 @@ Usage:
     python3 tools/subg_jam.py -c 9,14,15,19,20,24,106 --dwell 2
     python3 tools/subg_jam.py -c 9,14,15,19,20,24,106 --dwell 1 --cycles 5
     python3 tools/subg_jam.py -c 9,14,15,19,20,24,106 --dwell 2 --duration 300
-    python3 tools/subg_jam.py -p 28 -c 0,5,10,15,20,26 --dwell 2  # 863-876 MHz EU/UK
+    python3 tools/subg_jam.py -p 28 -c 0,13,26,39,52,65 --dwell 2  # 863-876 MHz EU/UK
 
 Ctrl+C stops cleanly (JAMMER_OFF, then closes the device) at any point.
 """
@@ -62,7 +62,7 @@ def main() -> None:
                      help="Channel spec, e.g. '9,14,15,19,20,24,106' or '0-9'")
     ap.add_argument("-p", "--page", type=int, default=31, choices=(28, 31),
                      help="KillerBee page: 31 = 915 MHz US ISM, channels 0-128 "
-                          "(default); 28 = 863-876 MHz EU/UK, channels 0-26 "
+                          "(default); 28 = 863-876 MHz EU/UK, channels 0-65 "
                           "(CC1354P10 only)")
     ap.add_argument("--dwell", type=float, default=2.0,
                      help="Seconds to jam each channel before hopping to the next "
