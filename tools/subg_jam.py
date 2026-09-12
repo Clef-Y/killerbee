@@ -4,7 +4,8 @@ subg_jam.py - Rotating continuous-carrier jammer for specific sub-1GHz
 channels, using KillerBee's CC1354P10 driver. Supports two bands via
 -p/--page: page 31 (default) = 915 MHz US ISM, channels 0-128; page 28 =
 863-876 MHz EU/UK, channels 0-65 (CC1354P10 only - see
-firmware/src/kb-cc1354p10/README.md's "Page 28 support" section).
+firmware/src/kb-cc1354p10/README.md's "Page 28 support" section). Can also
+rotate across *both* pages in a single run via --page-channels (see below).
 
 Starts constant-carrier PHY jamming (KBCapabilities.PHYJAM - modulated
 PRBS-15 garbage, not reflexive/reactive) on the first channel, then cycles
@@ -35,6 +36,12 @@ Usage:
     python3 tools/subg_jam.py -c 9,14,15,19,20,24,106 --dwell 2 --duration 300
     python3 tools/subg_jam.py -p 28 -c 0,13,26,39,52,65 --dwell 2  # 863-876 MHz EU/UK
 
+    # Circle through BOTH pages in one run, in the order given, repeating
+    # that same order every cycle - --page-channels overrides -p/-c:
+    python3 tools/subg_jam.py --dwell 0.036 \\
+        --page-channels 31:9,14,15,19,20,24,106 \\
+        --page-channels 28:10,12,20,41,51,57
+
 Ctrl+C stops cleanly (JAMMER_OFF, then closes the device) at any point.
 """
 
@@ -42,6 +49,7 @@ import argparse
 import os
 import sys
 import time
+from typing import List, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -51,6 +59,45 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from subg_scan import PAGE_INFO, parse_channels  # reuse, don't duplicate
 
 
+def parse_page_channels(specs: List[str]) -> List[Tuple[int, int]]:
+    """Parses repeated --page-channels 'PAGE:CHANNELS' arguments into a
+    flat, ordered list of (page, channel) hops - every page's channels in
+    the order given on the command line, each page's own channel spec
+    de-duped/ordered by parse_channels() same as single-page mode. Exits
+    the process with an error message on anything malformed or out of
+    range, same convention as the rest of this file's arg validation."""
+    hops: List[Tuple[int, int]] = []
+    for spec in specs:
+        if ":" not in spec:
+            print("error: --page-channels needs 'PAGE:CHANNELS' (e.g. "
+                  "'31:9,14,106'), got %r" % spec, file=sys.stderr)
+            sys.exit(1)
+        page_str, chan_str = spec.split(":", 1)
+        try:
+            page = int(page_str)
+        except ValueError:
+            print("error: invalid page %r in --page-channels %r"
+                  % (page_str, spec), file=sys.stderr)
+            sys.exit(1)
+        if page not in PAGE_INFO:
+            print("error: unsupported page %d in --page-channels %r "
+                  "(valid: %s)" % (page, spec, ", ".join(str(p) for p in PAGE_INFO)),
+                  file=sys.stderr)
+            sys.exit(1)
+        max_channel = PAGE_INFO[page]["max_channel"]
+        chans = parse_channels(chan_str)
+        if not chans:
+            print("error: no channels given in --page-channels %r" % spec, file=sys.stderr)
+            sys.exit(1)
+        for ch in chans:
+            if ch < 0 or ch > max_channel:
+                print("error: channel %d out of range (valid: 0-%d for page %d)"
+                      % (ch, max_channel, page), file=sys.stderr)
+                sys.exit(1)
+            hops.append((page, ch))
+    return hops
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -58,12 +105,22 @@ def main() -> None:
                      help="Serial device (default: /dev/ttyACM0)")
     ap.add_argument("-d", "--devtype", default="cc1354p10",
                      help="KillerBee hardware type (default: cc1354p10)")
-    ap.add_argument("-c", "--channels", required=True,
-                     help="Channel spec, e.g. '9,14,15,19,20,24,106' or '0-9'")
+    ap.add_argument("-c", "--channels", default=None,
+                     help="Channel spec, e.g. '9,14,15,19,20,24,106' or '0-9'. "
+                          "Single-page mode - paired with -p/--page. Ignored "
+                          "(and not required) if --page-channels is given.")
     ap.add_argument("-p", "--page", type=int, default=31, choices=(28, 31),
                      help="KillerBee page: 31 = 915 MHz US ISM, channels 0-128 "
                           "(default); 28 = 863-876 MHz EU/UK, channels 0-65 "
-                          "(CC1354P10 only)")
+                          "(CC1354P10 only). Ignored if --page-channels is given.")
+    ap.add_argument("--page-channels", action="append", default=None,
+                     metavar="PAGE:CHANNELS",
+                     help="Jam across multiple pages in a single rotation instead "
+                          "of one page: 'PAGE:CHANNELS' (e.g. "
+                          "'31:9,14,15,19,20,24,106'), repeatable - one per page. "
+                          "The full hop sequence is every given page's channels in "
+                          "the order the flags appear, repeating that same order "
+                          "each cycle. Overrides -c/-p entirely when given.")
     ap.add_argument("--dwell", type=float, default=2.0,
                      help="Seconds to jam each channel before hopping to the next "
                           "(default: 2.0)")
@@ -75,33 +132,45 @@ def main() -> None:
                           "unbounded, use Ctrl+C or --cycles instead)")
     args = ap.parse_args()
 
-    page_info = PAGE_INFO[args.page]
-    freq_mhz = page_info["freq_mhz"]
-    max_channel = page_info["max_channel"]
-
-    channels = parse_channels(args.channels)
-    if not channels:
-        print("error: no channels given", file=sys.stderr)
-        sys.exit(1)
-    for ch in channels:
-        if ch < 0 or ch > max_channel:
-            print("error: channel %d out of range (valid: 0-%d for page %d)"
-                  % (ch, max_channel, args.page), file=sys.stderr)
+    if args.page_channels:
+        hops = parse_page_channels(args.page_channels)
+    else:
+        if not args.channels:
+            print("error: no channels given (use -c/--channels or --page-channels)",
+                  file=sys.stderr)
             sys.exit(1)
+        max_channel = PAGE_INFO[args.page]["max_channel"]
+        channels = parse_channels(args.channels)
+        if not channels:
+            print("error: no channels given", file=sys.stderr)
+            sys.exit(1)
+        for ch in channels:
+            if ch < 0 or ch > max_channel:
+                print("error: channel %d out of range (valid: 0-%d for page %d)"
+                      % (ch, max_channel, args.page), file=sys.stderr)
+                sys.exit(1)
+        hops = [(args.page, ch) for ch in channels]
 
     kb = KillerBee(device=args.iface, hardware=args.devtype)
-    if not kb.check_capability(page_info["capability"]):
-        print("error: %s does not report %s support (page %d)"
-              % (args.devtype, page_info["band_name"], args.page), file=sys.stderr)
-        sys.exit(1)
+    for page in sorted(set(p for p, _ in hops)):
+        page_info = PAGE_INFO[page]
+        if not kb.check_capability(page_info["capability"]):
+            print("error: %s does not report %s support (page %d)"
+                  % (args.devtype, page_info["band_name"], page), file=sys.stderr)
+            sys.exit(1)
     if not kb.check_capability(KBCapabilities.PHYJAM):
         print("error: %s does not report PHYJAM (constant-carrier jam) support"
               % args.devtype, file=sys.stderr)
         sys.exit(1)
 
-    print("Jamming %d channel(s): %s" % (len(channels), args.channels))
+    if args.page_channels:
+        print("Jamming %d channel(s) across page(s) %s: %s"
+              % (len(hops), ", ".join(str(p) for p in sorted(set(p for p, _ in hops))),
+                 args.page_channels))
+    else:
+        print("Jamming %d channel(s) (page %d): %s" % (len(hops), args.page, args.channels))
     print("  %.1fs dwell/channel -> ~%.1fs per full cycle"
-          % (args.dwell, len(channels) * args.dwell))
+          % (args.dwell, len(hops) * args.dwell))
     if args.cycles:
         print("  stopping after %d cycle(s)" % args.cycles)
     elif args.duration:
@@ -114,23 +183,26 @@ def main() -> None:
     cycle = 0
     jamming = False
 
-    def print_hop(ch: int, note: str = "") -> None:
-        print("=== ch %3d (%6.1f MHz) - %.1fs%s ===" % (ch, freq_mhz[ch], args.dwell, note))
+    def print_hop(page: int, ch: int, note: str = "") -> None:
+        freq = PAGE_INFO[page]["freq_mhz"][ch]
+        print("=== page %2d ch %3d (%7.1f MHz) - %.1fs%s ==="
+              % (page, ch, freq, args.dwell, note))
 
     try:
+        first_page, first_ch = hops[0]
         # kb.jammer_on() (the generic KillerBee front door) doesn't forward
         # `page` through to the driver - only kb.driver.jammer_on() takes
         # it - so the sub-1GHz page must be set here directly to actually
         # jam on the intended band rather than silently defaulting to
         # 2.4GHz (page 0).
-        kb.driver.jammer_on(channel=channels[0], page=args.page, method="constant")
+        kb.driver.jammer_on(channel=first_ch, page=first_page, method="constant")
         jamming = True
-        print_hop(channels[0])
+        print_hop(first_page, first_ch)
         time.sleep(args.dwell)
 
         idx = 0
         while True:
-            idx = (idx + 1) % len(channels)
+            idx = (idx + 1) % len(hops)
             if idx == 0:
                 cycle += 1
                 if args.cycles and cycle >= args.cycles:
@@ -138,9 +210,9 @@ def main() -> None:
             if args.duration and (time.time() - run_start) >= args.duration:
                 break
 
-            ch = channels[idx]
-            print_hop(ch, " [cycle %d]" % (cycle + 1) if idx == 0 else "")
-            kb.set_channel(ch, page=args.page)  # firmware keeps the jam running across the hop
+            page, ch = hops[idx]
+            print_hop(page, ch, " [cycle %d]" % (cycle + 1) if idx == 0 else "")
+            kb.set_channel(ch, page=page)  # firmware keeps the jam running across the hop
             time.sleep(args.dwell)
     except KeyboardInterrupt:
         print("\nInterrupted.")
