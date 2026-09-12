@@ -318,6 +318,37 @@ python3 tools/jam24_hop.py -c 11,15,20,25 --dwell 0.05 --duration 30
 Same idea as `jam24_rotate.py` but for the 902-928 MHz band. See
 [Sub-1GHz tools](#sub-1ghz-tools-cc1354p10) below.
 
+#### `subg_jam_hop.py` (this fork, CC1354P10, sub-1GHz)
+
+Same jam as `subg_jam.py`, but the hop loop runs entirely on-chip
+(`KBCapabilities.PHYJAM_HOP`) instead of the host calling `SET_CHANNEL`
+once per hop - same measured ~30ms-per-hop control-plane tax this removes
+as `jam24_hop.py` does for 2.4GHz (see that entry above). Sub-1GHz only,
+and supports hopping across *both* page 31 (915 MHz) and page 28
+(863-876 MHz) in a single run via repeatable `--page-channels
+PAGE:CHANNELS`, same syntax `subg_jam.py` uses. See
+firmware/src/kb-cc1354p10/README.md's "On-chip channel-hop jamming"
+section for the full measurement, cross-page design notes, and hardware
+validation (including an independent RF-energy check).
+
+```
+usage: subg_jam_hop.py [-h] [-i IFACE] [-d DEVTYPE] --page-channels PAGE:CHANNELS
+                        [--dwell DWELL] [--duration DURATION]
+
+  -i IFACE            serial device (default: /dev/ttyACM0)
+  -d DEVTYPE          hardware type (default: cc1354p10)
+  --page-channels     'PAGE:CHANNELS' (e.g. '31:9,14,15,19,20,24,106'),
+                       repeatable - one per page (28 and/or 31) (required)
+  --dwell             seconds per channel before hopping (default: 0.02 = 20ms)
+  --duration          stop after N seconds total (default: 0 = unbounded, Ctrl+C)
+```
+
+```sh
+python3 tools/subg_jam_hop.py -i /dev/cu.usbmodemLS4501DC1 --dwell 0.02 \
+    --page-channels 31:9,14,15,19,20,24,106 \
+    --page-channels 28:10,12,20,41,51,57
+```
+
 ### Attack / flood tools
 
 These target a specific, already-identified network (PAN ID, coordinator

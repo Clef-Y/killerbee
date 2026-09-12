@@ -60,6 +60,22 @@
  * not be tuned for this range the way it is for 915 MHz US ISM, which
  * would affect real-world range/sensitivity but not correctness of the
  * channel plan itself.
+ *
+ * stage 6: + KB_CMD_JAM_HOP_ON, an on-chip rotating constant-carrier
+ * jammer across a host-supplied *cross-page* sub-1GHz channel list (page
+ * 31 and/or page 28 - deliberately not 2.4GHz/page 0 on this firmware,
+ * see jamHopThread() below) - ported from the CC1352P7 firmware's
+ * same-named, 2.4GHz-only version (see that firmware's main.c/README.md
+ * for the ~30ms-per-host-round-trip measurement motivating this). Each
+ * hop entry here is a [page][channel] pair, not a bare channel, since
+ * page 31 and page 28 - though both BAND_SUBG - use different
+ * rfTuneToChannel() frequency formulas; a bare channel number would be
+ * ambiguous (e.g. channel 20 exists validly on both pages, at very
+ * different real frequencies). jamHopThread() explicitly invalidates
+ * lastTuneValid on every page change within the hop sequence, same fix as
+ * KB_CMD_SET_CHANNEL already needed (see that handler's comment) - two
+ * consecutive hops landing on the same raw channel number across a page
+ * change would otherwise skip the retune entirely.
  */
 
 #include <stdint.h>
@@ -117,6 +133,7 @@
 #define KB_CMD_SET_SELFACK     0x09
 #define KB_CMD_RESET           0x0A
 #define KB_CMD_GET_RSSI        0x0B
+#define KB_CMD_JAM_HOP_ON      0x0C
 
 #define CMD_REPLY_BIT       0x80
 #define CMD_ASYNC_PACKET    0x90
@@ -349,6 +366,11 @@ static bool rfTuneToChannel(uint8_t ch);
 /* Forward declaration - selfAckSubgThread() needs rfTransmitOnce() (below)
  * to send its ACK replies via the same CMD_PROP_TX path INJECT uses. */
 static bool rfTransmitOnce(const uint8_t *frame, uint8_t len);
+
+/* Forward declaration - startJamHop() (below) needs rfSwitchBand() (much
+ * further below, in the "Band switching" section) to force BAND_SUBG
+ * before hopping, since hop pages are always sub-1GHz (28/31). */
+static bool rfSwitchBand(uint8_t targetBand);
 
 static bool rfSniffStartSubg(uint8_t ch)
 {
@@ -664,6 +686,7 @@ static bool rfTransmitOnce(const uint8_t *frame, uint8_t len)
 
 #define JAM_MODE_CONSTANT   0x00
 #define JAM_MODE_REFLEXIVE  0x01
+#define JAM_MODE_HOP        0x02
 
 /* HISTORICAL, now fixed - kept because the diagnosis is worth keeping
  * nearby to stopJammer()'s comment: sub-1GHz constant-carrier jamming used
@@ -846,6 +869,84 @@ static void *reflexJamThread(void *arg0)
     return NULL;
 }
 
+/* On-chip rotating constant-carrier jam across a host-supplied *cross-
+ * page* sub-1GHz channel list - see this file's header comment ("stage
+ * 6") for why this exists (removing the ~30ms-per-hop host-round-trip
+ * tax that driving the same rotation via repeated SET_CHANNEL calls
+ * pays) and why each hop entry is a [page][channel] pair rather than a
+ * bare channel (page 31 and page 28 use different rfTuneToChannel()
+ * frequency formulas at the same raw channel number). Sub-1GHz
+ * (BAND_SUBG) only - deliberately not offered on 2.4GHz/page 0 for this
+ * firmware.
+ *
+ * MAX_HOP_CHANNELS is a generous cap (not a real protocol limit like the
+ * CC1352P7 2.4GHz version's exact-16 channel count) - there's no natural
+ * "real channel count" bound across a mixed page 31 (129 channels)/page
+ * 28 (66 channels) list the way there is for 2.4GHz's fixed 11-26. */
+#define MAX_HOP_CHANNELS  32
+
+static uint8_t hopPages[MAX_HOP_CHANNELS];
+static uint8_t hopChannels[MAX_HOP_CHANNELS];
+static uint8_t hopChannelCount = 0;
+static uint32_t hopDwellUs = 0;
+static volatile bool hopRunning = false;
+static pthread_t hopThreadHandle;
+static bool hopThreadValid = false;
+
+static void *jamHopThread(void *arg0)
+{
+    size_t idx = 0;
+    bool firstHop = true;
+
+    while (hopRunning) {
+        if (hopPages[idx] != currentPage) {
+            /* Same fix KB_CMD_SET_CHANNEL already needed: page 31 and
+             * page 28 share BAND_SUBG, so a bare channel-number match in
+             * rfTuneToChannel()'s cache check would otherwise skip a real
+             * retune across a page change that happens to land on the
+             * same raw channel number (e.g. channel 20 exists on both
+             * pages, at very different real frequencies). */
+            lastTuneValid = false;
+        }
+        currentPage = hopPages[idx];
+        channel = hopChannels[idx]; /* keep GET_CHANNEL accurate mid-hop */
+
+        if (!firstHop) {
+            rfJamStop();
+        }
+        rfJamStart(hopChannels[idx]);
+        firstHop = false;
+
+        usleep(hopDwellUs);
+        if (!hopRunning) {
+            break;
+        }
+        idx = (idx + 1) % hopChannelCount;
+    }
+    rfJamStop();
+    return NULL;
+}
+
+/* Starts (or resumes, e.g. after KB_CMD_SET_CHANNEL stopped and is now
+ * restarting it - see startJammer()) hop jamming using whatever is
+ * currently in hopPages/hopChannels/hopChannelCount/hopDwellUs. Always
+ * forces BAND_SUBG first since hop pages are always sub-1GHz (28/31) -
+ * rfSwitchBand() is a no-op if already on that band. */
+static bool startJamHop(void)
+{
+    rfSwitchBand(BAND_SUBG);
+    hopRunning = true;
+    pthread_attr_t attrs;
+    pthread_attr_init(&attrs);
+    pthread_attr_setstacksize(&attrs, 1024);
+    if (pthread_create(&hopThreadHandle, &attrs, jamHopThread, NULL) != 0) {
+        hopRunning = false;
+        return false;
+    }
+    hopThreadValid = true;
+    return true;
+}
+
 /* Stops whichever jam mode is currently active.
  *
  * Constant-carrier jamming on the sub-1GHz PHY: the original hazard here
@@ -878,6 +979,12 @@ static void stopJammer(void)
             pthread_join(reflexThreadHandle, NULL);
             reflexThreadValid = false;
         }
+    } else if (jamMode == JAM_MODE_HOP) {
+        if (hopThreadValid) {
+            hopRunning = false;
+            pthread_join(hopThreadHandle, NULL);
+            hopThreadValid = false;
+        }
     } else {
         rfJamStop();
     }
@@ -902,6 +1009,13 @@ static bool startJammer(uint8_t mode, uint8_t ch)
         }
         reflexThreadValid = true;
         return true;
+    } else if (mode == JAM_MODE_HOP) {
+        /* hopPages/hopChannels/hopChannelCount/hopDwellUs are already
+         * populated - either by KB_CMD_JAM_HOP_ON just now, or retained
+         * from an earlier call if this is a resume (e.g. KB_CMD_SET_CHANNEL
+         * stopped hop mode and is now restarting it - ch is unused here,
+         * same as the JAM_MODE_REFLEXIVE branch above ignores it). */
+        return startJamHop();
     }
     return rfJamStart(ch);
 }
@@ -1110,6 +1224,60 @@ static void handleCommand(uint8_t cmd, const uint8_t *payload, uint8_t len)
         if (!jammerOn) {
             jammerOn = startJammer(mode, channel);
         }
+        sendStatus(cmd, jammerOn ? STATUS_OK : STATUS_ERROR);
+        break;
+    }
+
+    case KB_CMD_JAM_HOP_ON: {
+        /* payload = [dwell_ms lo][dwell_ms hi][count][page0][ch0]...
+         * [page(count-1)][ch(count-1)]. Sub-1GHz only - each pair must be
+         * (31, channel<=128) or (28, channel<=65) - see this file's
+         * header comment ("stage 6") and jamHopThread() for why each hop
+         * entry needs its own page rather than a bare channel. Stopped
+         * the same way as every other jam mode: KB_CMD_JAMMER_OFF
+         * (stopJammer() already handles JAM_MODE_HOP - no separate "off"
+         * command needed). */
+        bool badPayload = (len < 3);
+        uint8_t count = 0;
+        uint16_t dwellMs = 0;
+        if (!badPayload) {
+            memcpy(&dwellMs, &payload[0], 2);
+            count = payload[2];
+            badPayload = (dwellMs == 0 || count == 0 || count > MAX_HOP_CHANNELS
+                          || len != (uint8_t)(3 + 2 * count));
+        }
+        if (!badPayload) {
+            for (uint8_t i = 0; i < count; i++) {
+                uint8_t p = payload[3 + 2 * i];
+                uint8_t c = payload[3 + 2 * i + 1];
+                bool okPair = (p == 31 && c <= 128) || (p == 28 && c <= 65);
+                if (!okPair) {
+                    badPayload = true;
+                    break;
+                }
+            }
+        }
+        if (badPayload) {
+            sendStatus(cmd, STATUS_ERROR);
+            break;
+        }
+
+        if (snifferOn) {
+            rfSniffStop();
+            snifferOn = false;
+        }
+        if (jammerOn) {
+            stopJammer();
+        }
+
+        for (uint8_t i = 0; i < count; i++) {
+            hopPages[i] = payload[3 + 2 * i];
+            hopChannels[i] = payload[3 + 2 * i + 1];
+        }
+        hopChannelCount = count;
+        hopDwellUs = (uint32_t)dwellMs * 1000u;
+
+        jammerOn = startJammer(JAM_MODE_HOP, hopChannels[0]);
         sendStatus(cmd, jammerOn ? STATUS_OK : STATUS_ERROR);
         break;
     }

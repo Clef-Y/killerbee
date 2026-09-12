@@ -61,7 +61,7 @@ class KBCapabilities:
     FREQ_870: int      = 0x0d #: Capabilities Flag: Can perform 870-876 MHz sniffing (ch 0-26)
     FREQ_915: int      = 0x0e #: Capabilities Flag: Can perform 915-917 MHz sniffing (ch 0-26)
     FREQ_863_WIDE: int = 0x0f #: Capabilities Flag: Can perform 863-876 MHz sniffing at finer resolution (page 28, ch 0-65). A distinct flag from FREQ_863, not a superset/alias of it - some page-28 hardware (e.g. dev_sl_beehive.py/dev_sl_nodetest.py) packs the channel into a 5-bit field (channel & 0x1f) and silently wraps/corrupts above channel 31, so is_valid_channel()'s page-28 upper bound can't simply be raised for every FREQ_863 device. Only set this on hardware verified to accept the full 0-65 range (currently: the CC1354P10 firmware's page 28 - see firmware/src/kb-cc1354p10/README.md's "Page 28 support" section).
-    PHYJAM_HOP: int    = 0x10 #: Capabilities Flag: Can jam PHY Layer with an on-chip, host-round-trip-free channel-hopping rotation (currently: CC1352P7 firmware only - see firmware/src/kb-cc1352p7/README.md's "On-chip channel-hop jamming" section)
+    PHYJAM_HOP: int    = 0x10 #: Capabilities Flag: Can jam PHY Layer with an on-chip, host-round-trip-free channel-hopping rotation. CC1352P7 firmware: 2.4GHz only (bare channel list). CC1354P10 firmware: sub-1GHz only, cross-page (page 31/28) via (page, channel) pairs, since the two pages share a radio setup but use different frequency formulas. See each firmware's README.md's "On-chip channel-hop jamming" section - the exact hop-list shape each driver's jam_hop_on() expects differs (bare channels vs (page, channel) tuples), so check the specific driver in use.
 
     def __init__(self) -> None:
         self._capabilities: Dict[int, bool] = {

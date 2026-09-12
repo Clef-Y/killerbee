@@ -487,14 +487,21 @@ class KillerBee:
 
         return self.driver.jammer_off()
 
-    def jam_hop_on(self, channels: List[int], dwell_ms: int) -> None:
+    def jam_hop_on(self, channels: Any, dwell_ms: int) -> None:
         '''
         Starts a constant-carrier jam that hops across the given channel
         list entirely on-chip (no host round-trip per hop) - see
         KBCapabilities.PHYJAM_HOP. Stop with jammer_off(). Only supported
-        by drivers that implement it (currently: dev_cc1352p7.CC1352P7).
-        @type channels: List of Integers
-        @param channels: Channel numbers to hop across.
+        by drivers that implement it, and the shape of `channels` is
+        driver-specific: dev_cc1352p7.CC1352P7 (2.4GHz only) wants a plain
+        List[int] of channel numbers; dev_cc1354p10.CC1354P10 (sub-1GHz
+        only) wants a List[Tuple[int, int]] of (page, channel) pairs,
+        since it supports hopping across both page 31 and page 28 in one
+        run and those pages need different frequency formulas at the same
+        raw channel number. Check the specific driver's jam_hop_on() for
+        which shape it expects.
+        @type channels: List of Integers, or List of (page, channel) Tuples
+        @param channels: Channels (or (page, channel) pairs) to hop across.
         @type dwell_ms: Integer
         @param dwell_ms: Milliseconds to jam each channel before hopping.
         @rtype: None

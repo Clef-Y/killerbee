@@ -42,6 +42,7 @@ below.
 | SELFACK          | yes*      | Extra `driver.set_selfack()` method — see caveat below; no generic KillerBee-level setter exists in this codebase for any device. Both bands - hardware auto-ACK on 2.4GHz, software reflex on sub-1GHz (no hardware ACK support in `CMD_PROP_RX` - see "Sub-1GHz support") |
 | PHYJAM           | yes       | Continuous `CMD_TX_TEST` (modulated PRBS-15 garbage) - PHY-agnostic, works on either band |
 | PHYJAM_REFLEX    | yes*      | Best-effort software-loop reflex — see caveat below. Both bands - see "Sub-1GHz support" for the sub-1GHz-specific implementation notes |
+| PHYJAM_HOP       | yes       | `CMD_JAM_HOP_ON` - on-chip rotating jam across a cross-page sub-1GHz channel list (page 31/28), no host round trip per hop - see "On-chip channel-hop jamming" below. Sub-1GHz only on this firmware (2.4GHz on the CC1352P7 firmware instead) |
 | SET_SYNC         | no        | The native IEEE 802.15.4 RX/TX commands use a fixed, standard O-QPSK preamble/SFD; there is no register here to reprogram it (unlike CC2420-style radios) |
 | FREQ_2400        | yes       | |
 | FREQ_915         | yes       | 915 MHz US ISM, channels 0-128 - see "Sub-1GHz support" below |
@@ -586,6 +587,75 @@ range/sensitivity here may be materially worse than at 915 MHz even though
 the channel plan and RF core setup are both correct; that would show up as
 weak/noisy capture, not as a wrong frequency.
 
+## On-chip channel-hop jamming (`KBCapabilities.PHYJAM_HOP`, sub-1GHz only)
+
+`CMD_JAM_HOP_ON` (`0x0C`) starts a constant-carrier jam that rotates across
+a host-supplied, **cross-page** sub-1GHz channel list (page 31 and/or page
+28) entirely inside the firmware - `jamHopThread()` in `main.c` loops
+calling the same `rfTuneToChannel()`/`rfJamStart()`/`rfJamStop()` primitives
+`SET_CHANNEL` already uses, with no host round trip per hop. Ported from
+the CC1352P7 firmware's same-named, 2.4GHz-only version (see that
+firmware's README for the ~30ms-per-host-round-trip measurement that
+motivates this) - **deliberately not offered on 2.4GHz/page 0 on this
+firmware**, sub-1GHz only.
+
+**Each hop entry is a `[page][channel]` pair, not a bare channel** -
+`payload = [dwell_ms lo][dwell_ms hi][count][page0][ch0]...[page(n-1)][ch(n-1)]`,
+each pair either `(31, channel<=128)` or `(28, channel<=65)`. This is the
+one real design difference from the CC1352P7 version: that firmware's hop
+list is single-band (2.4GHz only, so a bare channel is unambiguous), but
+here page 31 and page 28 share the exact same `BAND_SUBG` radio setup
+while using *different* `rfTuneToChannel()` frequency formulas at the same
+raw channel number (channel 20 is valid on both pages, at very different
+real frequencies: 906.2 MHz on page 31, 867.0 MHz on page 28) - a bare
+channel number would be ambiguous.
+
+**A real bug this surfaced and fixed:** `rfTuneToChannel()`'s tune cache
+(`lastTuneValid`/`lastTunedChannel`) only ever compared the raw channel
+number, never the page - the exact same class of bug `KB_CMD_SET_CHANNEL`
+already needed fixing for (see the "Page 28 support" section above).
+`jamHopThread()` explicitly invalidates `lastTuneValid` whenever the
+*page* changes between consecutive hops, even when the raw channel number
+happens to differ too (which would have masked the bug by accident) -
+without this, two hops landing on the same raw channel number across a
+page change (e.g. ...->page 31 ch 20 -> page 28 ch 20->...) would have
+silently skipped the retune, jamming the wrong frequency. Also fixed a
+smaller, cosmetic-but-real gap: `jamHopThread()` (both here and in the
+CC1352P7 firmware) never updated the shared `channel` global, so
+`GET_CHANNEL` issued mid-hop reported a stale channel from before hopping
+started even though `currentPage` was correct - now updated on every hop.
+
+Python: `kb.jam_hop_on([(31, 9), (31, 14), (28, 10), ...], dwell_ms=20)`,
+stop with `kb.jammer_off()` - the same command that stops every other jam
+mode. CLI: `tools/subg_jam_hop.py`, using the same `--page-channels
+PAGE:CHANNELS` syntax as `tools/subg_jam.py`'s cross-page host-driven
+version:
+
+```sh
+python3 tools/subg_jam_hop.py -i /dev/cu.usbmodemLS4501DC1 --dwell 0.02 \
+    --page-channels 31:9,14,15,19,20,24,106 \
+    --page-channels 28:10,12,20,41,51,57
+```
+
+**Hardware-validated with real RF evidence, not just command-level
+success.** Command-level: `JAM_HOP_ON` accepted for a valid 13-entry
+cross-page list, device stays fully responsive to `PING`/`GET_CHANNEL`
+while hopping (`GET_CHANNEL` mid-hop correctly reported a real
+in-progress channel/page pair from the list, e.g. channel 51/page 28),
+`JAMMER_OFF` stops it cleanly, and all three invalid-payload cases
+(page 0, out-of-range channel for page 28, out-of-range channel for page
+31) correctly rejected with `STATUS_ERROR`. Beyond that: verified with an
+independent RF energy check using a second board (CC1352P7, which also
+supports page 31 - though not page 28) doing ambient RSSI sampling
+(`GET_RSSI` while sniffing) on each page-31 target channel while this one
+hopped the full cross-page list at 20ms dwell - every page-31 channel in
+the list showed a clear spike (~-77 to -87 dBm) against a much quieter
+~-105 to -119 dBm baseline on channels *not* in the list, confirming real,
+on-air hopping (the page-28 portion isn't independently RF-verifiable this
+way since no second board here can tune there, but the same
+`rfTuneToChannel()`/`rfJamStart()` code path already validated for page 28
+elsewhere, plus the `GET_CHANNEL` mid-hop evidence above, cover it).
+
 ## Wire protocol
 
 921600 baud, 8N1, no flow control, no CRC (short USB-serial link, matches the
@@ -610,6 +680,7 @@ Device -> Host:  [0xA5][CMD|0x80] [LEN][LEN bytes payload]   (reply to CMD)
 | 0x09 | SET_SELFACK      | `[enable]`                                      | `[status]` |
 | 0x0A | RESET            | —                                                | `[status]` |
 | 0x0B | GET_RSSI         | —                                                | `[rssi int8]` |
+| 0x0C | JAM_HOP_ON       | `[dwell_ms lo][dwell_ms hi][count][page0][ch0]...[page(n-1)][ch(n-1)]` (sub-1GHz only: each pair (31, ch<=128) or (28, ch<=65)) | `[status]` |
 | 0x90 | (async) PACKET   | n/a — device-initiated                          | `[rssi int8][crc_ok u8][timestamp u32 LE][framelen u8][frame...]` |
 
 `status`: `0x00` = OK, `0x01` = ERROR. `frame` is the PSDU including the

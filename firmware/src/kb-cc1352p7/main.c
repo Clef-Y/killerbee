@@ -864,6 +864,7 @@ static void *jamHopThread(void *arg0)
 {
     size_t idx = 0;
 
+    channel = hopChannels[0]; /* keep GET_CHANNEL accurate mid-hop */
     rfJamStart(hopChannels[0]);
     while (hopRunning) {
         usleep(hopDwellUs);
@@ -871,6 +872,7 @@ static void *jamHopThread(void *arg0)
             break;
         }
         idx = (idx + 1) % hopChannelCount;
+        channel = hopChannels[idx]; /* keep GET_CHANNEL accurate mid-hop */
         /* Stop/retune/restart, same sequence KB_CMD_SET_CHANNEL already
          * uses (and has validated) for hopping while jamming - see this
          * file's rfJamStart()/rfJamStop(). All-on-chip, so this whole

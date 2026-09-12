@@ -46,6 +46,19 @@ Wire protocol (921600 8N1):
                          RX operation (i.e. SNIFFER_ON already sent) or it
                          returns TI's own documented error sentinel,
                          RF_GET_RSSI_ERROR_VAL = -128 (see RFCC26X2.h).
+  CMD_JAM_HOP_ON   0x0C  payload=[dwell_ms lo][dwell_ms hi][count]
+                         [page0][ch0]...[page(count-1)][ch(count-1)]
+                         -> reply [status]. Sub-1GHz only - each pair must
+                         be (31, channel<=128) or (28, channel<=65).
+                         Starts a constant-carrier jam that hops across
+                         the given *cross-page* channel list entirely
+                         on-chip - no host round-trip per hop, unlike
+                         driving the same rotation via repeated
+                         CMD_SET_CHANNEL calls. Each hop is a [page][ch]
+                         pair, not a bare channel, since page 31 and page
+                         28 use different frequency formulas at the same
+                         raw channel number. Stopped with the existing
+                         CMD_JAMMER_OFF. See main.c's "stage 6" comment.
 
   Async packet (CMD 0x90) payload:
       [rssi int8][crc_ok uint8][timestamp uint32 LE][framelen uint8][frame...]
@@ -56,7 +69,7 @@ See firmware/src/kb-cc1354p10/README.md for the full protocol writeup and
 the RF-core command semantics behind each operation.
 '''
 
-from typing import Optional, Dict, Union, Any, List
+from typing import Optional, Dict, Union, Any, List, Tuple
 
 import struct
 import time
@@ -79,6 +92,7 @@ CMD_JAMMER_OFF: int = 0x08
 CMD_SET_SELFACK: int = 0x09
 CMD_RESET: int = 0x0A
 CMD_GET_RSSI: int = 0x0B
+CMD_JAM_HOP_ON: int = 0x0C
 
 RF_GET_RSSI_ERROR_VAL: int = -128
 
@@ -87,6 +101,7 @@ CMD_ASYNC_PACKET: int = 0x90
 
 JAM_MODE_CONSTANT: int = 0x00
 JAM_MODE_REFLEXIVE: int = 0x01
+MAX_HOP_CHANNELS: int = 32  # matches firmware's MAX_HOP_CHANNELS
 
 STATUS_OK: int = 0x00
 
@@ -167,6 +182,13 @@ class CC1354P10:
         self.capabilities.setcapab(KBCapabilities.SELFACK, True)
         self.capabilities.setcapab(KBCapabilities.PHYJAM, True)
         self.capabilities.setcapab(KBCapabilities.PHYJAM_REFLEX, True)
+        # On-chip channel-hop jamming (CMD_JAM_HOP_ON) - sub-1GHz only on
+        # this firmware (pages 31/28; ported from the CC1352P7 firmware's
+        # 2.4GHz-only version) - see firmware/src/kb-cc1354p10/main.c's
+        # "stage 6" comment. jam_hop_on() enforces the sub-1GHz-only
+        # restriction; this flag just advertises on-chip hop support in
+        # general, same as how PHYJAM's specifics are validated per-device.
+        self.capabilities.setcapab(KBCapabilities.PHYJAM_HOP, True)
         # The native IEEE 802.15.4 RX/TX radio commands use a fixed,
         # standard-compliant O-QPSK preamble/SFD - there is no register to
         # reprogram the PHY sync word the way CC2420-style radios expose one.
@@ -409,6 +431,44 @@ class CC1354P10:
 
     def jammer_off(self) -> None:
         self.__command(CMD_JAMMER_OFF)
+
+    def jam_hop_on(self, hops: List[Tuple[int, int]], dwell_ms: int) -> None:
+        '''
+        Starts a constant-carrier jam that hops across the given
+        *cross-page* sub-1GHz channel list entirely on-chip - no host
+        round-trip per hop, unlike driving the same rotation via repeated
+        set_channel() calls (what tools/subg_jam.py's --page-channels does).
+        See firmware/src/kb-cc1354p10/README.md's "On-chip channel-hop
+        jamming" section for why this exists and how it compares. Stop
+        with jammer_off() - the same command that stops every other jam
+        mode.
+        @param hops: List of (page, channel) tuples, in hop order. page
+            must be 31 (channel 0-128) or 28 (channel 0-65) - 2.4GHz
+            (page 0) is not supported by this on-chip hop command on this
+            firmware. Each entry carries its own page (not a bare
+            channel) since page 31 and page 28 use different frequency
+            formulas at the same raw channel number.
+        @param dwell_ms: milliseconds to jam each channel before hopping to
+            the next (1-65535).
+        '''
+        self.capabilities.require(KBCapabilities.PHYJAM_HOP)
+        if not hops or len(hops) > MAX_HOP_CHANNELS:
+            raise Exception('hops must be 1-%d (page, channel) tuples' % MAX_HOP_CHANNELS)
+        for page, ch in hops:
+            okPair = (page == 31 and 0 <= ch <= 128) or (page == 28 and 0 <= ch <= 65)
+            if not okPair:
+                raise Exception('Invalid (page=%d, channel=%d) - must be '
+                                 '(31, 0-128) or (28, 0-65); 2.4GHz (page 0) is '
+                                 'not supported by this on-chip hop command' % (page, ch))
+        if dwell_ms < 1 or dwell_ms > 0xFFFF:
+            raise Exception('dwell_ms must be 1-65535')
+
+        payload = struct.pack('<HB', dwell_ms, len(hops))
+        for page, ch in hops:
+            payload += bytes([page, ch])
+        status = self.__command(CMD_JAM_HOP_ON, payload)
+        if status[0] != STATUS_OK:
+            raise Exception("Device rejected jam_hop_on()")
 
     def set_sync(self, sync: int = 0xA70F) -> Any:
         self.capabilities.require(KBCapabilities.SET_SYNC)
