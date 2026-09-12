@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
-subg_scan.py - Sub-1GHz (915 MHz US ISM) channel scanner for KillerBee's
-CC1354P10 driver.
+subg_scan.py - Sub-1GHz channel scanner for KillerBee's CC1354P10 driver.
+Supports two bands via -p/--page: page 31 (default) = 915 MHz US ISM,
+channels 0-128; page 28 = 863-876 MHz EU/UK, channels 0-26 (CC1354P10
+only - see firmware/src/kb-cc1354p10/README.md's "Page 28 support"
+section).
 
-Scans a configurable set of channels (default 0-9, the first 10 of the
-real 129-channel SUN O-QPSK Rate Mode 0 plan - 902.2 + 0.2*channel MHz,
-spanning 902.2-927.8 MHz. Verified directly against TI's own ti154stack
-(their real IEEE 802.15.4g/SUN protocol stack source, in the installed
-SDK) rather than assumed - see firmware/src/kb-cc1354p10/README.md's
+Scans a configurable set of channels (default 0-9, the first 10 of page
+31's real 129-channel SUN O-QPSK Rate Mode 0 plan - 902.2 + 0.2*channel
+MHz, spanning 902.2-927.8 MHz. Verified directly against TI's own
+ti154stack (their real IEEE 802.15.4g/SUN protocol stack source, in the
+installed SDK) rather than assumed - see firmware/src/kb-cc1354p10/README.md's
 "Sub-1GHz support" section for the full story, including an earlier,
 wrong channel plan this project used before being corrected), each for a
 configurable dwell time, and writes:
@@ -34,6 +37,9 @@ Examples:
 
     # Full real channel plan (0-128, 129 channels - long at any real dwell)
     python3 tools/subg_scan.py -c 0-128
+
+    # Page 28: 863-876 MHz EU/UK, channels 0-26, CC1354P10 only
+    python3 tools/subg_scan.py -p 28 -c 0-26 -t 60
 
     # Custom device and output directory
     python3 tools/subg_scan.py -i /dev/ttyACM0 -o /tmp/myscan
@@ -65,7 +71,25 @@ from killerbee import KillerBee, KBCapabilities, PcapDumper, DLT_IEEE802_15_4  #
 # TI ti154stack source verification behind these numbers. This is NOT
 # what kb.frequency() would print (a different, generic page-31 formula
 # from kbutils.py) - documented, deliberate divergence.
-FREQ_MHZ = {ch: round(902.2 + 0.2 * ch, 1) for ch in range(0, 129)}
+FREQ_MHZ_PAGE31 = {ch: round(902.2 + 0.2 * ch, 1) for ch in range(0, 129)}
+
+# Page 28 (CC1354P10 only): 863-876 MHz EU/UK, channels 0-26, 863.0 +
+# 0.5*channel MHz - a project-local channel plan (no single real standard
+# covers this exact span/channel count), see
+# firmware/src/kb-cc1354p10/README.md's "Page 28 support" section.
+FREQ_MHZ_PAGE28 = {ch: round(863.0 + 0.5 * ch, 1) for ch in range(0, 27)}
+
+PAGE_INFO = {
+    31: {"freq_mhz": FREQ_MHZ_PAGE31, "max_channel": 128,
+         "capability": KBCapabilities.FREQ_915, "band_name": "915 MHz US ISM"},
+    28: {"freq_mhz": FREQ_MHZ_PAGE28, "max_channel": 26,
+         "capability": KBCapabilities.FREQ_863, "band_name": "863-876 MHz EU/UK"},
+}
+
+# Back-compat alias: tools/subg_track.py (page-31-only, not extended to
+# page 28 here - out of scope for the CC1354P10-only page 28 addition)
+# still imports this name directly.
+FREQ_MHZ = FREQ_MHZ_PAGE31
 
 FRAME_TYPE_NAMES = {0: "Beacon", 1: "Data", 2: "Ack", 3: "MAC Command"}
 
@@ -128,6 +152,7 @@ def decode_frame(raw: bytes) -> Dict[str, Any]:
 
 
 def scan_channel(kb: KillerBee, ch: int, dwell: float, pcap_path: str,
+                  page: int, freq_mhz: Dict[int, float],
                   poll: float = 0.5, rssi_interval: float = 1.0,
                   sample_rssi: bool = True
                   ) -> "tuple[List[Dict[str, Any]], List[Dict[str, Any]]]":
@@ -149,7 +174,7 @@ def scan_channel(kb: KillerBee, ch: int, dwell: float, pcap_path: str,
     main()'s startup probe.
 
     Returns (packets, rssi_samples)."""
-    kb.set_channel(ch, page=31)
+    kb.set_channel(ch, page=page)
     kb.sniffer_on()
 
     dumper: Optional[PcapDumper] = None
@@ -185,7 +210,7 @@ def scan_channel(kb: KillerBee, ch: int, dwell: float, pcap_path: str,
             raw = pkt["bytes"]
             record: Dict[str, Any] = {
                 "channel": ch,
-                "freq_mhz": FREQ_MHZ[ch],
+                "freq_mhz": freq_mhz[ch],
                 "timestamp": pkt["datetime"].isoformat() if pkt.get("datetime") else None,
                 "rssi_dbm": pkt.get("rssi"),
                 "crc_ok": bool(pkt.get("validcrc")),
@@ -197,7 +222,7 @@ def scan_channel(kb: KillerBee, ch: int, dwell: float, pcap_path: str,
 
             if dumper is None:
                 dumper = PcapDumper(DLT_IEEE802_15_4, pcap_path)
-            dumper.pcap_dump(raw, ant_dbm=pkt.get("rssi"), freq_mhz=FREQ_MHZ[ch])
+            dumper.pcap_dump(raw, ant_dbm=pkt.get("rssi"), freq_mhz=freq_mhz[ch])
     finally:
         if dumper is not None:
             dumper.close()
@@ -220,10 +245,10 @@ def rssi_stats(samples: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
 
 def format_report(channels: List[int], dwell: float,
                    results: Dict[int, Dict[str, Any]],
-                   outdir: str) -> str:
+                   outdir: str, page: int, freq_mhz: Dict[int, float]) -> str:
     lines = []
     lines.append("=" * 72)
-    lines.append("Sub-1GHz (915 MHz US ISM) scan report")
+    lines.append("Sub-1GHz (%s, page %d) scan report" % (PAGE_INFO[page]["band_name"], page))
     lines.append("Generated: %s" % datetime.datetime.now().isoformat())
     lines.append("Dwell per channel: %.1fs" % dwell)
     lines.append("Channels scanned: %s" % ", ".join(str(c) for c in channels))
@@ -257,13 +282,13 @@ def format_report(channels: List[int], dwell: float,
             if stats:
                 quiet_lines.append(
                     "  ch %3d (%6.1f MHz): ambient min=%4d avg=%6.1f max=%4d dBm, no packets"
-                    % (ch, FREQ_MHZ[ch], stats["min"], stats["avg"], stats["max"])
+                    % (ch, freq_mhz[ch], stats["min"], stats["avg"], stats["max"])
                 )
             continue
 
         active_channels += 1
         lines.append("")
-        lines.append("--- Channel %d (%.1f MHz) ---" % (ch, FREQ_MHZ[ch]))
+        lines.append("--- Channel %d (%.1f MHz) ---" % (ch, freq_mhz[ch]))
         lines.append("  Packets captured: %d (%d with valid CRC)" % (len(pkts), len(valid)))
         if stats:
             lines.append("  Ambient RSSI: min=%d avg=%.1f max=%d dBm (%d samples)"
@@ -326,6 +351,10 @@ def main() -> None:
     ap.add_argument("-c", "--channels", default="0-9",
                      help="Channel spec, e.g. '0-128' (full real plan) or '0,64,128' "
                           "(default: 0-9)")
+    ap.add_argument("-p", "--page", type=int, default=31, choices=(28, 31),
+                     help="KillerBee page: 31 = 915 MHz US ISM, channels 0-128 "
+                          "(default); 28 = 863-876 MHz EU/UK, channels 0-26 "
+                          "(CC1354P10 only)")
     ap.add_argument("-o", "--outdir", default=None,
                      help="Output directory (default: ./subg_scan_<timestamp>)")
     ap.add_argument("--rssi-interval", type=float, default=1.0,
@@ -334,19 +363,24 @@ def main() -> None:
                      help="Disable ambient RSSI sampling (packet capture only)")
     args = ap.parse_args()
 
+    page_info = PAGE_INFO[args.page]
+    freq_mhz = page_info["freq_mhz"]
+    max_channel = page_info["max_channel"]
+
     channels = parse_channels(args.channels)
     for ch in channels:
-        if ch < 0 or ch > 128:
-            print("error: channel %d out of range (valid: 0-128)" % ch, file=sys.stderr)
+        if ch < 0 or ch > max_channel:
+            print("error: channel %d out of range (valid: 0-%d for page %d)"
+                  % (ch, max_channel, args.page), file=sys.stderr)
             sys.exit(1)
 
     outdir = args.outdir or ("subg_scan_%s" % datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
     os.makedirs(outdir, exist_ok=True)
 
     kb = KillerBee(device=args.iface, hardware=args.devtype)
-    if not kb.check_capability(KBCapabilities.FREQ_915):
-        print("error: %s does not report sub-1GHz (FREQ_915) support" % args.devtype,
-              file=sys.stderr)
+    if not kb.check_capability(page_info["capability"]):
+        print("error: %s does not report %s support (page %d)"
+              % (args.devtype, page_info["band_name"], args.page), file=sys.stderr)
         sys.exit(1)
 
     sample_rssi = not args.no_rssi
@@ -364,8 +398,9 @@ def main() -> None:
     try:
         for ch in channels:
             pcap_path = os.path.join(outdir, "ch%d.pcap" % ch)
-            print("=== Channel %d (%.1f MHz) - %.1fs ===" % (ch, FREQ_MHZ[ch], args.dwell))
+            print("=== Channel %d (%.1f MHz) - %.1fs ===" % (ch, freq_mhz[ch], args.dwell))
             packets, rssi_samples = scan_channel(kb, ch, args.dwell, pcap_path,
+                                                  page=args.page, freq_mhz=freq_mhz,
                                                   rssi_interval=args.rssi_interval,
                                                   sample_rssi=sample_rssi)
             results[ch] = {"packets": packets, "rssi_samples": rssi_samples}
@@ -388,7 +423,7 @@ def main() -> None:
         except Exception:
             pass
 
-    report_text = format_report(scanned, args.dwell, results, outdir)
+    report_text = format_report(scanned, args.dwell, results, outdir, args.page, freq_mhz)
     print("\n" + report_text)
 
     report_path = os.path.join(outdir, "report.txt")

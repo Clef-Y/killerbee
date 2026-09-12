@@ -37,15 +37,16 @@ below.
 | KBCapabilities   | Supported | Notes |
 |------------------|-----------|-------|
 | SNIFF            | yes       | Promiscuous `CMD_IEEE_RX` (2.4GHz) / `CMD_PROP_RX` (915MHz), frame filtering off by default |
-| SETCHAN          | yes       | Channels 11-26 (2.4 GHz, page 0) and 0-128 (915 MHz, page 31) |
-| INJECT           | yes       | `CMD_IEEE_TX` (2.4GHz) / `CMD_PROP_TX` (915MHz), hardware auto-computes/appends the FCS |
+| SETCHAN          | yes       | Channels 11-26 (2.4 GHz, page 0), 0-128 (915 MHz US ISM, page 31), and 0-26 (863-876 MHz EU/UK, page 28 - CC1354P10 only) |
+| INJECT           | yes       | `CMD_IEEE_TX` (2.4GHz) / `CMD_PROP_TX` (sub-1GHz, both pages), hardware auto-computes/appends the FCS |
 | SELFACK          | yes*      | Extra `driver.set_selfack()` method — see caveat below; no generic KillerBee-level setter exists in this codebase for any device. Both bands - hardware auto-ACK on 2.4GHz, software reflex on sub-1GHz (no hardware ACK support in `CMD_PROP_RX` - see "Sub-1GHz support") |
 | PHYJAM           | yes       | Continuous `CMD_TX_TEST` (modulated PRBS-15 garbage) - PHY-agnostic, works on either band |
 | PHYJAM_REFLEX    | yes*      | Best-effort software-loop reflex — see caveat below. Both bands - see "Sub-1GHz support" for the sub-1GHz-specific implementation notes |
 | SET_SYNC         | no        | The native IEEE 802.15.4 RX/TX commands use a fixed, standard O-QPSK preamble/SFD; there is no register here to reprogram it (unlike CC2420-style radios) |
 | FREQ_2400        | yes       | |
 | FREQ_915         | yes       | 915 MHz US ISM, channels 0-128 - see "Sub-1GHz support" below |
-| FREQ_900/863/868/870 | no    | Only 2.4 GHz and 915 MHz US ISM are configured in this firmware |
+| FREQ_863         | yes       | 863-876 MHz EU/UK, channels 0-26, CC1354P10 only - see "Page 28 support" below. Project-local channel plan, does not match `kbutils.py`'s existing generic page-28 formula (written for older Silabs hardware) - see that section for why |
+| FREQ_900/868/870 | no        | Not configured in this firmware |
 | BOOT             | no        | No bootloader protocol exposed over this UART; reflash via the debug probe (see below) |
 
 \* **Self-ACK caveat:** enabling auto-ACK (`RF_cmdIeeeRx.frameFiltOpt.autoAckEn`)
@@ -520,6 +521,57 @@ working fix (reduced sub-1GHz TX power) that followed from the diagnosis.
   firmware-side mitigation for a hardware power-delivery limitation, not a
   fix to the underlying limitation itself.
 
+## Page 28 support (863-876 MHz EU/UK, channels 0-26, CC1354P10 only)
+
+Added as `stage 5` (see the file header comment). Reuses the exact same
+SUN O-QPSK Rate Mode 0 radio setup as page 31 above - no new
+`kb_cc1354p10.syscfg` radio config, no new RF driver setup - `rfSwitchBand()`
+treats page 28 and page 31 as the same `BAND_SUBG`, only `rfTuneToChannel()`
+picks a different frequency formula based on `currentPage`. Deliberately
+**CC1354P10-only**, not added to the CC1352P7 firmware or to the generic
+`KBCapabilities`/`kbutils.py` page-28 handling (see below for why).
+
+**Channel plan:** channel *n* (0-26) = `863.0 + 0.5*n` MHz, spanning
+863-876 MHz end to end with even 0.5 MHz spacing (channel 26 lands on
+exactly 876.0 MHz). This is a **project-local** channel numbering, not a
+real external standard's - unlike page 31's plan (which mirrors TI's own
+SUN/802.15.4g 915 MHz numbering exactly), no single standard channel plan
+covers this specific 863-876 MHz span with exactly 27 channels, so this
+firmware picked a clean, full-range, evenly-spaced sweep instead of trying
+to match one.
+
+**Deliberately does not match `killerbee/kbutils.py`'s existing, generic
+page-28 `KBCapabilities.frequency()`/`is_valid_channel()` handling.** That
+generic helper already had a page-28 case before this firmware existed -
+written for older Silabs hardware (`dev_sl_beehive.py`/`dev_sl_nodetest.py`,
+both real `FREQ_863`-capable devices), with its own different formula
+(`863.25 + 0.2*ch` MHz, upper-bounded the same channel range but a
+narrower ~5.2 MHz actual span). Changing that shared helper to match this
+firmware's wider 863-876 MHz plan would have silently changed frequency
+reporting for that unrelated hardware too. So this firmware's page 28
+support is entirely self-contained in `dev_cc1354p10.py`'s own
+`set_channel()` range check (`channel <= 26`, gated on `FREQ_863`) and this
+file's `rfTuneToChannel()` - it does not call or share
+`KBCapabilities.frequency()`/`is_valid_channel()` at all, exactly like page
+31 already didn't. `kb.frequency(channel, page=28)` will report the wrong
+(Silabs) frequency for this device, same caveat as page 31's `frequency()`
+divergence above.
+
+**Same band-switch cost/risk as page 0<->31** - switching between page 0
+(2.4 GHz) and page 28 tears down and rebuilds the RF driver connection
+exactly like page 0<->31 does (see "Switching bands is a real, deliberate
+risk" above); switching *between* page 28 and page 31 does not (`BAND_SUBG`
+in both cases), just a fast `CMD_FS` retune.
+
+Not yet hardware-validated against real over-the-air 863-876 MHz traffic -
+only that `SET_CHANNEL`/scanning/jamming complete without hanging, the
+same "plumbing works" bar page 31 was held to before its own
+validation. The `LP-EM-CC1354P10` boosterpack's antenna matching network
+was very likely tuned for 915 MHz (US ISM), not this range - real-world
+range/sensitivity here may be materially worse than at 915 MHz even though
+the channel plan and RF core setup are both correct; that would show up as
+weak/noisy capture, not as a wrong frequency.
+
 ## Wire protocol
 
 921600 baud, 8N1, no flow control, no CRC (short USB-serial link, matches the
@@ -535,7 +587,7 @@ Device -> Host:  [0xA5][CMD|0x80] [LEN][LEN bytes payload]   (reply to CMD)
 |------|------------------|------------------------------------------------|---------------|
 | 0x01 | PING             | —                                                | ASCII firmware ID, e.g. `KB-CC1354P10 v1.0` |
 | 0x02 | GET_CHANNEL      | —                                                | `[channel][page]` |
-| 0x03 | SET_CHANNEL      | `[channel]` or `[channel][page]` (page 0: 11-26, page 31: 0-128) | `[status]` |
+| 0x03 | SET_CHANNEL      | `[channel]` or `[channel][page]` (page 0: 11-26, page 31: 0-128, page 28: 0-26) | `[status]` |
 | 0x04 | SNIFFER_ON       | —                                                | `[status]` |
 | 0x05 | SNIFFER_OFF      | —                                                | `[status]` |
 | 0x06 | INJECT           | `[count][delay_ms lo][delay_ms hi][frame...]`   | `[status]` |

@@ -24,9 +24,12 @@ Wire protocol (921600 8N1):
                          omitted); page 31 = 915MHz US ISM SUN O-QPSK
                          Rate Mode 0 (channel 0-128, 902.2 + 0.2*channel
                          MHz - the real standard channel plan, verified
-                         against TI's own ti154stack) - switches the RF
-                         core's radio setup at runtime, see main.c's
-                         "stage 4" comment.
+                         against TI's own ti154stack); page 28 = 863-876MHz
+                         EU/UK SUN O-QPSK Rate Mode 0 (channel 0-26, 863.0 +
+                         0.5*channel MHz - a project-local channel plan, see
+                         main.c's "stage 5"/"Page 28 support" comments for
+                         why - switches the RF core's radio setup at
+                         runtime, see main.c's "stage 4" comment.
   CMD_SNIFFER_ON   0x04  -> reply [status]
   CMD_SNIFFER_OFF  0x05  -> reply [status]
   CMD_INJECT       0x06  payload=[count][delay_ms lo][delay_ms hi][frame...]
@@ -125,7 +128,6 @@ class CC1354P10:
     def __set_capabilities(self) -> None:
         self.capabilities.setcapab(KBCapabilities.FREQ_2400, True)
         self.capabilities.setcapab(KBCapabilities.FREQ_900, False)
-        self.capabilities.setcapab(KBCapabilities.FREQ_863, False)
         self.capabilities.setcapab(KBCapabilities.FREQ_868, False)
         self.capabilities.setcapab(KBCapabilities.FREQ_870, False)
         # 915 MHz US ISM, channels 0-128 (902.2 + 0.2*channel MHz - the
@@ -134,6 +136,15 @@ class CC1354P10:
         # switches to at runtime - see firmware/src/kb-cc1354p10/main.c's
         # "stage 4" header comment.
         self.capabilities.setcapab(KBCapabilities.FREQ_915, True)
+        # 863-876 MHz EU/UK, channels 0-26 (863.0 + 0.5*channel MHz - a
+        # project-local channel plan, NOT the same as KBCapabilities'
+        # generic page-28 frequency() formula, which was written for older
+        # Silabs hardware's narrower 863-868 MHz sub-band; kb.frequency()
+        # will report the wrong frequency for this device on page 28, same
+        # as the already-documented page 31 divergence) - CC1354P10 only,
+        # see firmware/src/kb-cc1354p10/main.c's "stage 5"/README.md's
+        # "Page 28 support" section.
+        self.capabilities.setcapab(KBCapabilities.FREQ_863, True)
 
         self.capabilities.setcapab(KBCapabilities.SNIFF, True)
         self.capabilities.setcapab(KBCapabilities.SETCHAN, True)
@@ -274,8 +285,18 @@ class CC1354P10:
                                  'band - the real SUN O-QPSK Rate Mode 0 channel plan, '
                                  '902.2 + 0.2*channel MHz, verified against TI\'s own '
                                  'ti154stack; see firmware/src/kb-cc1354p10/README.md)')
+        elif page == 28:
+            self.capabilities.require(KBCapabilities.FREQ_863)
+            if channel < 0 or channel > 26:
+                raise Exception('Invalid channel (must be 0-26 for the 863-876 MHz EU/UK '
+                                 'band - a project-local channel plan specific to this '
+                                 'firmware, 863.0 + 0.5*channel MHz, NOT the same as '
+                                 'KBCapabilities\' generic page-28 frequency() formula; '
+                                 'see firmware/src/kb-cc1354p10/README.md\'s "Page 28 '
+                                 'support" section)')
         else:
-            raise Exception('Unsupported page %d - only 0 (2.4 GHz) and 31 (915 MHz) exist on this device' % page)
+            raise Exception('Unsupported page %d - only 0 (2.4 GHz), 28 (863-876 MHz EU/UK) '
+                             'and 31 (915 MHz US ISM) exist on this device' % page)
         status = self.__command(CMD_SET_CHANNEL, bytes([channel, page]))
         if status[0] != STATUS_OK:
             raise Exception("Device rejected channel %d (page %d)" % (channel, page))

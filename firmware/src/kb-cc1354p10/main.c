@@ -42,6 +42,21 @@
  * separate sub-1GHz-only firmware image would have avoided the risk
  * entirely, at the cost of needing a reflash to switch bands. Not yet
  * hardware-validated.
+ *
+ * stage 5 (CC1354P10 only): + KillerBee page 28, the 863-876 MHz EU/UK SRD
+ * band, channels 0-26 (863.0 + 0.5*ch MHz - a clean, evenly-spaced plan
+ * covering the full 863-876 MHz range end to end; this is a project-local
+ * channel numbering, not the same as kbutils.py's generic FREQ_863
+ * KBCapabilities.frequency() formula, which was written for older Silabs
+ * hardware's narrower 863-868 MHz sub-band - see rfTuneToChannel()'s
+ * comment). Reuses the exact same SUN O-QPSK Rate Mode 0 radio setup as
+ * page 31 (same PHY, just a different tuned frequency per channel), so it
+ * rides the same BAND_SUBG RF_open()/CMD_PROP_RX/TX path - no new radio
+ * setup needed. Not yet hardware-validated against real 863-876 MHz
+ * traffic; the LP-EM-CC1354P10 boosterpack's antenna matching network may
+ * not be tuned for this range the way it is for 915 MHz US ISM, which
+ * would affect real-world range/sensitivity but not correctness of the
+ * channel plan itself.
  */
 
 #include <stdint.h>
@@ -211,8 +226,12 @@ static RF_Handle rfHandle;
 static RF_CmdHandle sniffCmdHandle = RF_ALLOC_ERROR;
 
 /* BAND_24GHZ = native IEEE 802.15.4 (KillerBee page 0, channels 11-26).
- * BAND_SUBG = 915 MHz SUN O-QPSK (KillerBee page 31, channels 1-10). See
- * rfSwitchBand() for the RF_close()/RF_open() transition between them. */
+ * BAND_SUBG = the SUN O-QPSK Rate Mode 0 radio setup, shared by both
+ * KillerBee page 31 (915 MHz US ISM, channels 0-128) and page 28 (863-876
+ * MHz EU/UK, channels 0-26, CC1354P10 only) - same PHY/radio setup for
+ * both, currentPage picks which frequency formula rfTuneToChannel() uses.
+ * See rfSwitchBand() for the RF_close()/RF_open() transition between
+ * BAND_24GHZ and BAND_SUBG. */
 #define BAND_24GHZ  0
 #define BAND_SUBG   1
 static uint8_t currentBand = BAND_24GHZ;
@@ -572,7 +591,17 @@ static bool rfPostAndPoll(RF_Op *op, uint16_t okStatus)
  *
  * KillerBee's own kbutils.py page-31 frequency() helper uses yet another,
  * different formula - this mapping intentionally does not match it either;
- * see README.md's Sub-1GHz support section for that caveat, still true. */
+ * see README.md's Sub-1GHz support section for that caveat, still true.
+ *
+ * Page 28 (CC1354P10 only, 863-876 MHz EU/UK) reuses this exact same SUN
+ * O-QPSK Rate Mode 0 radio setup - only the tuned frequency differs, via
+ * a separate, evenly-spaced formula (863.0 + 0.5*ch MHz, channels 0-26,
+ * spanning the full 863-876 MHz range end to end): channel n -> 863.0 +
+ * 0.5*n MHz. This is a project-local channel plan (unlike page 31's,
+ * which mirrors a real TI/SUN standard channel numbering) since no single
+ * standard channel plan covers this exact 863-876 MHz span; picked for a
+ * clean, full-range sweep rather than matching any specific existing
+ * device's numbering. */
 static bool rfTuneToChannel(uint8_t ch)
 {
     if (lastTuneValid && ch == lastTunedChannel) {
@@ -584,7 +613,9 @@ static bool rfTuneToChannel(uint8_t ch)
         /* Floating point (this core has an FPU; this runs once per channel
          * change, not a hot loop) to mirror TI's own conversion exactly
          * rather than approximate it with integer rounding tricks. */
-        double freqMHz = (902200.0 + 200.0 * (double)ch) / 1000.0;
+        double freqMHz = (currentPage == 28)
+                ? (863000.0 + 500.0 * (double)ch) / 1000.0
+                : (902200.0 + 200.0 * (double)ch) / 1000.0;
         double intPart = floor(freqMHz);
         double fractRaw = (freqMHz - intPart) * 65536.0;
         double fractCmd = ceil(round(fractRaw / 51.2) * 51.2);
@@ -929,8 +960,9 @@ static void handleCommand(uint8_t cmd, const uint8_t *payload, uint8_t len)
 
     case KB_CMD_SET_CHANNEL: {
         /* payload = [channel] (legacy, always page 0/2.4GHz) or
-         * [channel][page] (page 0 = 2.4GHz 11-26, page 31 = 915MHz SUN
-         * O-QPSK 1-10, matching KillerBee's own FREQ_915 page number). */
+         * [channel][page] (page 0 = 2.4GHz 11-26; page 31 = 915MHz SUN
+         * O-QPSK 0-128, matching KillerBee's own FREQ_915 page number;
+         * page 28 = 863-876MHz EU/UK SUN O-QPSK 0-26, CC1354P10 only). */
         if (len < 1 || len > 2) {
             sendStatus(cmd, STATUS_ERROR);
             break;
@@ -941,7 +973,8 @@ static void handleCommand(uint8_t cmd, const uint8_t *payload, uint8_t len)
         /* page 31 range is 0-128 (129 channels) - the real SUN O-QPSK
          * Rate Mode 0 channel plan, see rfTuneToChannel()'s comment. */
         bool validRange = (newPage == 0 && newChannel >= 11 && newChannel <= 26)
-                        || (newPage == 31 && newChannel <= 128);
+                        || (newPage == 31 && newChannel <= 128)
+                        || (newPage == 28 && newChannel <= 26);
         if (!validRange) {
             sendStatus(cmd, STATUS_ERROR);
             break;
@@ -957,7 +990,15 @@ static void handleCommand(uint8_t cmd, const uint8_t *payload, uint8_t len)
             stopJammer();
         }
 
-        bool ok = rfSwitchBand(newPage == 31 ? BAND_SUBG : BAND_24GHZ);
+        bool ok = rfSwitchBand((newPage == 31 || newPage == 28) ? BAND_SUBG : BAND_24GHZ);
+        if (newPage != currentPage) {
+            /* rfSwitchBand() only invalidates the tune cache on an actual
+             * BAND_24GHZ<->BAND_SUBG transition - page 28 and page 31 share
+             * BAND_SUBG, so hopping between them with the same channel
+             * number wouldn't otherwise retune (same cached channel, very
+             * different real frequency). */
+            lastTuneValid = false;
+        }
         channel = newChannel;
         currentPage = newPage;
 

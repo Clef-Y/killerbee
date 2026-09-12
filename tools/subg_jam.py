@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
 subg_jam.py - Rotating continuous-carrier jammer for specific sub-1GHz
-(915 MHz US ISM) channels, using KillerBee's CC1354P10 driver.
+channels, using KillerBee's CC1354P10 driver. Supports two bands via
+-p/--page: page 31 (default) = 915 MHz US ISM, channels 0-128; page 28 =
+863-876 MHz EU/UK, channels 0-26 (CC1354P10 only - see
+firmware/src/kb-cc1354p10/README.md's "Page 28 support" section).
 
 Starts constant-carrier PHY jamming (KBCapabilities.PHYJAM - modulated
 PRBS-15 garbage, not reflexive/reactive) on the first channel, then cycles
@@ -30,6 +33,7 @@ Usage:
     python3 tools/subg_jam.py -c 9,14,15,19,20,24,106 --dwell 2
     python3 tools/subg_jam.py -c 9,14,15,19,20,24,106 --dwell 1 --cycles 5
     python3 tools/subg_jam.py -c 9,14,15,19,20,24,106 --dwell 2 --duration 300
+    python3 tools/subg_jam.py -p 28 -c 0,5,10,15,20,26 --dwell 2  # 863-876 MHz EU/UK
 
 Ctrl+C stops cleanly (JAMMER_OFF, then closes the device) at any point.
 """
@@ -44,7 +48,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from killerbee import KillerBee, KBCapabilities  # type: ignore
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from subg_scan import FREQ_MHZ, parse_channels  # reuse, don't duplicate
+from subg_scan import PAGE_INFO, parse_channels  # reuse, don't duplicate
 
 
 def main() -> None:
@@ -56,6 +60,10 @@ def main() -> None:
                      help="KillerBee hardware type (default: cc1354p10)")
     ap.add_argument("-c", "--channels", required=True,
                      help="Channel spec, e.g. '9,14,15,19,20,24,106' or '0-9'")
+    ap.add_argument("-p", "--page", type=int, default=31, choices=(28, 31),
+                     help="KillerBee page: 31 = 915 MHz US ISM, channels 0-128 "
+                          "(default); 28 = 863-876 MHz EU/UK, channels 0-26 "
+                          "(CC1354P10 only)")
     ap.add_argument("--dwell", type=float, default=2.0,
                      help="Seconds to jam each channel before hopping to the next "
                           "(default: 2.0)")
@@ -67,19 +75,24 @@ def main() -> None:
                           "unbounded, use Ctrl+C or --cycles instead)")
     args = ap.parse_args()
 
+    page_info = PAGE_INFO[args.page]
+    freq_mhz = page_info["freq_mhz"]
+    max_channel = page_info["max_channel"]
+
     channels = parse_channels(args.channels)
     if not channels:
         print("error: no channels given", file=sys.stderr)
         sys.exit(1)
     for ch in channels:
-        if ch < 0 or ch > 128:
-            print("error: channel %d out of range (valid: 0-128)" % ch, file=sys.stderr)
+        if ch < 0 or ch > max_channel:
+            print("error: channel %d out of range (valid: 0-%d for page %d)"
+                  % (ch, max_channel, args.page), file=sys.stderr)
             sys.exit(1)
 
     kb = KillerBee(device=args.iface, hardware=args.devtype)
-    if not kb.check_capability(KBCapabilities.FREQ_915):
-        print("error: %s does not report sub-1GHz (FREQ_915) support" % args.devtype,
-              file=sys.stderr)
+    if not kb.check_capability(page_info["capability"]):
+        print("error: %s does not report %s support (page %d)"
+              % (args.devtype, page_info["band_name"], args.page), file=sys.stderr)
         sys.exit(1)
     if not kb.check_capability(KBCapabilities.PHYJAM):
         print("error: %s does not report PHYJAM (constant-carrier jam) support"
@@ -102,15 +115,15 @@ def main() -> None:
     jamming = False
 
     def print_hop(ch: int, note: str = "") -> None:
-        print("=== ch %3d (%6.1f MHz) - %.1fs%s ===" % (ch, FREQ_MHZ[ch], args.dwell, note))
+        print("=== ch %3d (%6.1f MHz) - %.1fs%s ===" % (ch, freq_mhz[ch], args.dwell, note))
 
     try:
         # kb.jammer_on() (the generic KillerBee front door) doesn't forward
         # `page` through to the driver - only kb.driver.jammer_on() takes
         # it - so the sub-1GHz page must be set here directly to actually
-        # jam on the 915 MHz band rather than silently defaulting to 2.4GHz
-        # (page 0).
-        kb.driver.jammer_on(channel=channels[0], page=31, method="constant")
+        # jam on the intended band rather than silently defaulting to
+        # 2.4GHz (page 0).
+        kb.driver.jammer_on(channel=channels[0], page=args.page, method="constant")
         jamming = True
         print_hop(channels[0])
         time.sleep(args.dwell)
@@ -127,7 +140,7 @@ def main() -> None:
 
             ch = channels[idx]
             print_hop(ch, " [cycle %d]" % (cycle + 1) if idx == 0 else "")
-            kb.set_channel(ch, page=31)  # firmware keeps the jam running across the hop
+            kb.set_channel(ch, page=args.page)  # firmware keeps the jam running across the hop
             time.sleep(args.dwell)
     except KeyboardInterrupt:
         print("\nInterrupted.")
