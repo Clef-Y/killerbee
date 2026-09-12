@@ -75,8 +75,10 @@ sub-1GHz PHY difference called out above for the one real capability
 delta). Differs only in the firmware ID string (`KB-CC1352P7` instead of
 `KB-CC1354P10`), that IEEE_DONE_OK-style status codes on this device
 family come from the `cc13x2x7_cc26x2x7` driverlib headers (no dual-PAN
-command fields, but this firmware never touched those anyway), and the
-sub-1GHz PHY itself (above).
+command fields, but this firmware never touched those anyway), the
+sub-1GHz PHY itself (above), and one addition in the other direction:
+`0x0C`/`KB_CMD_JAM_HOP_ON` (`KBCapabilities.PHYJAM_HOP`) exists only here,
+not on the CC1354P10 - see "On-chip channel-hop jamming" below.
 
 **Known shared risk, confirmed present on this chip too:** the 2.4GHz <->
 sub-1GHz band switch (`RF_close()`+`RF_open()` in `rfSwitchBand()`) is the
@@ -143,6 +145,69 @@ Auto-detection also works (no `hardware=` needed) as long as
 `DEV_ENABLE_CC1352P7` is `True` in `killerbee/config.py` (it is, by
 default) — `KillerBee()` will probe serial devices with
 `kbutils.iscc1352p7()`.
+
+## On-chip channel-hop jamming (`KBCapabilities.PHYJAM_HOP`, CC1352P7 only)
+
+`CMD_JAM_HOP_ON` (0x0C) starts a constant-carrier jam that rotates across a
+host-supplied 2.4GHz channel list (page 0, channels 11-26) entirely inside
+the firmware - `jamHopThread()` in `main.c` loops calling the same
+`rfTuneToChannel()`/`rfJamStart()`/`rfJamStop()` primitives `SET_CHANNEL`
+already uses, with no host round trip per hop. Stopped the same way as
+every other jam mode, `JAMMER_OFF` - no separate "off" command.
+
+```python
+kb.jam_hop_on([11, 12, 13, 14, 15, 20, 22, 26], dwell_ms=20)
+time.sleep(10)
+kb.jammer_off()
+```
+
+or via `tools/jam24_hop.py`:
+
+```sh
+python3 tools/jam24_hop.py -i /dev/cu.usbmodemL45003IW1 -c 11,12,13,14,15,20,22,26 --dwell 0.02
+```
+
+**Why this exists, not just `tools/jam24_rotate.py`:** driving the exact
+same rotation by having the host call `SET_CHANNEL` once per hop pays a
+real, fixed per-hop cost. Measured directly on this project's hardware (a
+sibling board, same USB/XDS110-debug-probe architecture): a near-flat
+~30ms round trip per `SET_CHANNEL` call, and critically, **the same ~30ms
+whether or not any real RF retuning happens at all** - a `PING` (zero RF
+work), a same-channel `SET_CHANNEL` (firmware's tune cache skips the
+retune), a real cross-channel retune, and a full stop/retune/restart while
+jamming all measured within noise of each other. That proves the ~30ms is
+a fixed USB/debug-probe control-plane tax, not RF circuit response time -
+the RF core's own work is negligible next to it. So a `--dwell` below
+~30ms is meaningless with the host-driven approach (the fixed floor
+dominates regardless); looping the hop entirely on-chip removes that tax,
+leaving the real per-hop cost as `rfTuneToChannel()`'s own
+`rfPostAndPoll()` polling grain (~1ms worst case) plus whatever dwell was
+asked for - two orders of magnitude tighter, and `--dwell` values well
+under 30ms (e.g. 20ms, as above) become meaningful.
+
+**2.4GHz only, deliberately.** `MAX_HOP_CHANNELS` is 16 - the exact count
+of real channels (11-26) - and every channel in the list is range-checked
+before starting. Restarting after an unrelated `SET_CHANNEL` (e.g. a
+sniffer/inject call that stops and later needs to resume hop-jamming) is
+handled - `startJammer()`'s `JAM_MODE_HOP` branch re-arms
+`jamHopThread()` from the retained channel list/dwell rather than losing
+the rotation.
+
+**Hardware-validated with real RF evidence, not just command-level
+success.** Command-level: `JAM_HOP_ON` accepted, device stays fully
+responsive to `PING`/`GET_CHANNEL` while hopping, `JAMMER_OFF` stops it
+cleanly, and all three invalid-payload cases (out-of-range channel,
+`dwell_ms=0`, channel-count/length mismatch) correctly rejected with
+`STATUS_ERROR`. Beyond that: verified with an independent RF energy check
+using a second board (CC1354P10) doing ambient RSSI sampling
+(`GET_RSSI` while sniffing) on each target channel while this one hopped
+`[11,12,13,14,15,20,22,26]` at 20ms dwell - every listed channel showed a
+strong, repeatable spike (~-59 to -70 dBm) against a ~-106 to -112 dBm
+noise floor, while channels *not* in the list stayed much closer to
+baseline. Confirms real, on-air hopping across exactly the given channels,
+not just a firmware state machine that doesn't crash. Also ran a
+sustained 20-second/~125-cycle continuous hop with no degradation and a
+healthy board immediately after.
 
 ## Validation status
 

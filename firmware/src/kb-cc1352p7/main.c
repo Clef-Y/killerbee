@@ -42,6 +42,23 @@
  * separate sub-1GHz-only firmware image would have avoided the risk
  * entirely, at the cost of needing a reflash to switch bands. Not yet
  * hardware-validated.
+ *
+ * stage 5: + KB_CMD_JAM_HOP_ON, an on-chip rotating constant-carrier
+ * jammer across a host-supplied 2.4 GHz channel list (page 0, channels
+ * 11-26) - see jamHopThread() below. Exists because driving a channel
+ * rotation by having the host repeatedly call SET_CHANNEL (what
+ * tools/jam24_rotate.py does) pays a real per-hop cost: measured directly
+ * (see kb-cc1354p10's git history, same USB/debug-probe architecture) at
+ * a near-fixed ~30ms round trip per SET_CHANNEL call, regardless of
+ * whether any real RF retuning happens - a fixed control-plane/USB-bridge
+ * tax completely unrelated to the RF core's own (sub-millisecond) retune
+ * time. Looping the hop entirely inside this firmware, with no host
+ * round-trip per hop, removes that tax - the real per-hop cost then
+ * becomes rfTuneToChannel()'s own rfPostAndPoll() polling grain (~1ms
+ * worst case) plus whatever dwell the caller asked for, not ~30ms plus
+ * dwell. JAM_HOP reuses the exact same rfJamStart()/rfJamStop() constant-
+ * carrier primitives KB_CMD_JAMMER_ON already uses - only the on-chip
+ * hopping loop (jamHopThread()) is new.
  */
 
 #include <stdint.h>
@@ -106,6 +123,7 @@
 #define KB_CMD_SET_SELFACK     0x09
 #define KB_CMD_RESET           0x0A
 #define KB_CMD_GET_RSSI        0x0B
+#define KB_CMD_JAM_HOP_ON      0x0C
 
 #define CMD_REPLY_BIT       0x80
 #define CMD_ASYNC_PACKET    0x90
@@ -334,6 +352,11 @@ static bool rfTuneToChannel(uint8_t ch);
 /* Forward declaration - selfAckSubgThread() needs rfTransmitOnce() (below)
  * to send its ACK replies via the same CMD_PROP_TX path INJECT uses. */
 static bool rfTransmitOnce(const uint8_t *frame, uint8_t len);
+
+/* Forward declaration - startJamHop() (below) needs rfSwitchBand() (much
+ * further below, in the "Band switching" section) to force BAND_24GHZ
+ * before hopping, since hop channels are always page-0 2.4GHz. */
+static bool rfSwitchBand(uint8_t targetBand);
 
 static bool rfSniffStartSubg(uint8_t ch)
 {
@@ -634,6 +657,7 @@ static bool rfTransmitOnce(const uint8_t *frame, uint8_t len)
 
 #define JAM_MODE_CONSTANT   0x00
 #define JAM_MODE_REFLEXIVE  0x01
+#define JAM_MODE_HOP        0x02
 
 /* HISTORICAL, now fixed - kept because the diagnosis is worth keeping
  * nearby to stopJammer()'s comment: sub-1GHz constant-carrier jamming used
@@ -816,6 +840,71 @@ static void *reflexJamThread(void *arg0)
     return NULL;
 }
 
+/* On-chip rotating constant-carrier jam across a host-supplied 2.4 GHz
+ * channel list - see this file's header comment ("stage 5") for why this
+ * exists (removing the ~30ms-per-hop host-round-trip tax that driving the
+ * same rotation via repeated SET_CHANNEL calls pays). 2.4GHz/page-0 only:
+ * hopChannels are always in the native IEEE 802.15.4 band, so
+ * jamHopThread() never needs to consider BAND_SUBG the way
+ * reflexJamThread() above does.
+ *
+ * MAX_HOP_CHANNELS matches the exact count of real 2.4GHz channels
+ * (11-26 inclusive) - there is no legitimate reason for a caller to name
+ * more than that. */
+#define MAX_HOP_CHANNELS  16
+
+static uint8_t hopChannels[MAX_HOP_CHANNELS];
+static uint8_t hopChannelCount = 0;
+static uint32_t hopDwellUs = 0;
+static volatile bool hopRunning = false;
+static pthread_t hopThreadHandle;
+static bool hopThreadValid = false;
+
+static void *jamHopThread(void *arg0)
+{
+    size_t idx = 0;
+
+    rfJamStart(hopChannels[0]);
+    while (hopRunning) {
+        usleep(hopDwellUs);
+        if (!hopRunning) {
+            break;
+        }
+        idx = (idx + 1) % hopChannelCount;
+        /* Stop/retune/restart, same sequence KB_CMD_SET_CHANNEL already
+         * uses (and has validated) for hopping while jamming - see this
+         * file's rfJamStart()/rfJamStop(). All-on-chip, so this whole
+         * sequence costs on the order of rfTuneToChannel()'s own
+         * rfPostAndPoll() polling grain (~1ms worst case), not the ~30ms
+         * a host-driven SET_CHANNEL round trip costs for the equivalent
+         * stop/retune/restart over USB. */
+        rfJamStop();
+        rfJamStart(hopChannels[idx]);
+    }
+    rfJamStop();
+    return NULL;
+}
+
+/* Starts (or resumes, e.g. after KB_CMD_SET_CHANNEL stopped and is now
+ * restarting it - see startJammer()) hop jamming using whatever is
+ * currently in hopChannels/hopChannelCount/hopDwellUs. Always forces
+ * BAND_24GHZ first since hop channels are only ever page-0 2.4GHz -
+ * rfSwitchBand() is a no-op if already on that band. */
+static bool startJamHop(void)
+{
+    rfSwitchBand(BAND_24GHZ);
+    hopRunning = true;
+    pthread_attr_t attrs;
+    pthread_attr_init(&attrs);
+    pthread_attr_setstacksize(&attrs, 1024);
+    if (pthread_create(&hopThreadHandle, &attrs, jamHopThread, NULL) != 0) {
+        hopRunning = false;
+        return false;
+    }
+    hopThreadValid = true;
+    return true;
+}
+
 /* Stops whichever jam mode is currently active.
  *
  * Constant-carrier jamming on the sub-1GHz PHY: the original hazard here
@@ -848,6 +937,12 @@ static void stopJammer(void)
             pthread_join(reflexThreadHandle, NULL);
             reflexThreadValid = false;
         }
+    } else if (jamMode == JAM_MODE_HOP) {
+        if (hopThreadValid) {
+            hopRunning = false;
+            pthread_join(hopThreadHandle, NULL);
+            hopThreadValid = false;
+        }
     } else {
         rfJamStop();
     }
@@ -872,6 +967,13 @@ static bool startJammer(uint8_t mode, uint8_t ch)
         }
         reflexThreadValid = true;
         return true;
+    } else if (mode == JAM_MODE_HOP) {
+        /* hopChannels/hopChannelCount/hopDwellUs are already populated -
+         * either by KB_CMD_JAM_HOP_ON just now, or retained from an
+         * earlier call if this is a resume (e.g. KB_CMD_SET_CHANNEL
+         * stopped hop mode and is now restarting it - ch is unused here,
+         * same as the JAM_MODE_REFLEXIVE branch above ignores it). */
+        return startJamHop();
     }
     return rfJamStart(ch);
 }
@@ -1069,6 +1171,52 @@ static void handleCommand(uint8_t cmd, const uint8_t *payload, uint8_t len)
         if (!jammerOn) {
             jammerOn = startJammer(mode, channel);
         }
+        sendStatus(cmd, jammerOn ? STATUS_OK : STATUS_ERROR);
+        break;
+    }
+
+    case KB_CMD_JAM_HOP_ON: {
+        /* payload = [dwell_ms lo][dwell_ms hi][count][ch0]...[ch(count-1)].
+         * 2.4GHz (page 0) only, channels 11-26 - see this file's header
+         * comment ("stage 5") and jamHopThread() for why this exists.
+         * Stopped the same way as every other jam mode: KB_CMD_JAMMER_OFF
+         * (stopJammer() already handles JAM_MODE_HOP - no separate "off"
+         * command needed). */
+        bool badPayload = (len < 4);
+        uint8_t count = 0;
+        uint16_t dwellMs = 0;
+        if (!badPayload) {
+            memcpy(&dwellMs, &payload[0], 2);
+            count = payload[2];
+            badPayload = (dwellMs == 0 || count == 0 || count > MAX_HOP_CHANNELS
+                          || len != (uint8_t)(3 + count));
+        }
+        if (!badPayload) {
+            for (uint8_t i = 0; i < count; i++) {
+                if (payload[3 + i] < 11 || payload[3 + i] > 26) {
+                    badPayload = true;
+                    break;
+                }
+            }
+        }
+        if (badPayload) {
+            sendStatus(cmd, STATUS_ERROR);
+            break;
+        }
+
+        if (snifferOn) {
+            rfSniffStop();
+            snifferOn = false;
+        }
+        if (jammerOn) {
+            stopJammer();
+        }
+
+        memcpy(hopChannels, &payload[3], count);
+        hopChannelCount = count;
+        hopDwellUs = (uint32_t)dwellMs * 1000u;
+
+        jammerOn = startJammer(JAM_MODE_HOP, hopChannels[0]);
         sendStatus(cmd, jammerOn ? STATUS_OK : STATUS_ERROR);
         break;
     }

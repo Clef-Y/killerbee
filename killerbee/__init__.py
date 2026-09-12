@@ -487,3 +487,21 @@ class KillerBee:
 
         return self.driver.jammer_off()
 
+    def jam_hop_on(self, channels: List[int], dwell_ms: int) -> None:
+        '''
+        Starts a constant-carrier jam that hops across the given channel
+        list entirely on-chip (no host round-trip per hop) - see
+        KBCapabilities.PHYJAM_HOP. Stop with jammer_off(). Only supported
+        by drivers that implement it (currently: dev_cc1352p7.CC1352P7).
+        @type channels: List of Integers
+        @param channels: Channel numbers to hop across.
+        @type dwell_ms: Integer
+        @param dwell_ms: Milliseconds to jam each channel before hopping.
+        @rtype: None
+        '''
+
+        if self.driver is None:
+            raise KBInterfaceError("Driver not configured")
+
+        return self.driver.jam_hop_on(channels, dwell_ms)
+

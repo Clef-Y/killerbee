@@ -283,6 +283,36 @@ python3 tools/jam24_rotate.py -c 11,15,20,25 --dwell 2      # more channels, fas
 python3 tools/jam24_rotate.py --duration 300 --cycles 0     # run for 5 minutes then stop
 ```
 
+#### `jam24_hop.py` (this fork, CC1352P7 only)
+
+Same jam and channel rotation as `jam24_rotate.py`, but the hop loop runs
+entirely on-chip (`KBCapabilities.PHYJAM_HOP`) instead of the host calling
+`SET_CHANNEL` once per hop - removes a measured, near-flat ~30ms
+per-hop USB/debug-probe control-plane tax that dominates `jam24_rotate.py`'s
+`--dwell` below ~30ms regardless of the value chosen. See
+firmware/src/kb-cc1352p7/README.md's "On-chip channel-hop jamming" section
+for the full measurement and hardware validation (including an independent
+RF-energy check confirming genuine on-air hopping, not just command-level
+success). Trade-off: no live per-hop log, since the host isn't in the loop.
+
+```
+usage: jam24_hop.py [-h] [-i IFACE] [-d DEVTYPE] -c CHANNELS
+                     [--dwell DWELL] [--duration DURATION]
+
+  -i IFACE       serial device (default: /dev/ttyACM0)
+  -d DEVTYPE     hardware type (default: cc1352p7 - the only one that
+                 currently implements this)
+  -c CHANNELS    channel spec, e.g. '11,12,13,14,15,20,22,26' or '11-26' (required)
+  --dwell        seconds per channel before hopping (default: 0.02 = 20ms;
+                 converted to whole milliseconds for the firmware)
+  --duration     stop after N seconds total (default: 0 = unbounded, Ctrl+C)
+```
+
+```sh
+python3 tools/jam24_hop.py -i /dev/cu.usbmodemL45003IW1 -c 11,12,13,14,15,20,22,26 --dwell 0.02
+python3 tools/jam24_hop.py -c 11,15,20,25 --dwell 0.05 --duration 30
+```
+
 #### `subg_jam.py` (this fork, CC1354P10, sub-1GHz)
 
 Same idea as `jam24_rotate.py` but for the 902-928 MHz band. See
