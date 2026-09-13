@@ -88,7 +88,7 @@ from datetime import datetime
 
 import serial  # type: ignore
 
-from .kbutils import KBCapabilities, makeFCS
+from .kbutils import KBCapabilities, makeFCS, drain_serial
 
 KB_SOF: int = 0xA5
 
@@ -150,10 +150,13 @@ class CC1352P7:
         # still be delivering a previous session's leftover response bytes
         # (already in flight over USB when the flush ran) if this port was
         # recently opened/closed elsewhere (e.g. zbid's own probing). Drain
-        # until genuinely empty so the first real command's reply can't get
+        # until genuinely empty (several consecutive empty reads, not just
+        # one - a real backlog can arrive in bursts with gaps wider than a
+        # single read's timeout; see drain_serial()'s own comment for a
+        # confirmed 300+-byte case this exact single-empty-read version
+        # used to miss) so the first real command's reply can't get
         # misframed by stale bytes ahead of it.
-        while self.handle.read(64):
-            pass
+        drain_serial(self.handle)
 
         self.capabilities: KBCapabilities = KBCapabilities()
         self.__set_capabilities()

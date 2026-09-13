@@ -209,7 +209,7 @@ def main() -> None:
     ap.add_argument("-i", "--iface", required=True, help="Serial device")
     ap.add_argument("-d", "--devtype", default="cc1354p10", choices=("cc1354p10", "cc1352p7"),
                      help="KillerBee hardware type (default: cc1354p10)")
-    ap.add_argument("--pages", default="28,31,0",
+    ap.add_argument("-p", "--pages", default="28,31,0",
                      help="Comma list of pages to scan, in the order given (default: "
                           "28,31,0 - every page both firmwares configure, sub-1GHz "
                           "first and 2.4GHz last deliberately - see this script's "

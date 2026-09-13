@@ -353,6 +353,46 @@ def get_serial_devs(seriallist: List[str]) -> None:
     global DEV_ENABLE_FREAKDUINO, DEV_ENABLE_ZIGDUINO
     #TODO Continue moving code from line 163:181 here, yielding results
 
+def drain_serial(handle: Any, required_empty_reads: int = 5) -> int:
+    '''
+    Reads and discards from an already-open serial handle until it has
+    been observed empty across several *consecutive* read attempts, not
+    just one. A single empty read only proves silence for one
+    read-timeout's worth of time - a large stale backlog (e.g. many
+    unread replies queued from an earlier process that crashed or was
+    killed mid-command, never draining what the device had already sent)
+    can arrive in bursts with gaps between them wider than a single
+    read's timeout, fooling a single-empty-read drain (what every caller
+    of this function used to do inline) into stopping early and leaving
+    real leftover bytes to corrupt the next command's framing. Confirmed
+    directly on real hardware: a genuine backlog of 300+ bytes, from
+    several interrupted background processes over a long session, needed
+    147 read attempts (with real gaps between bursts) to fully clear -
+    several of those attempts came back empty before more stale data
+    arrived, which a required_empty_reads of 1 would have missed entirely.
+    @type handle: serial.Serial
+    @param handle: An already-open serial handle. Its configured timeout
+        governs how long each individual read waits - this function never
+        changes it (see dev_cc1354p10.py/dev_cc1352p7.py's __read_exact()
+        for why mutating a CDC-ACM handle's timeout after construction is
+        itself a separate, confirmed source of dropped bytes on macOS).
+    @type required_empty_reads: int
+    @param required_empty_reads: Consecutive empty reads required before
+        considering the port genuinely drained.
+    @rtype: int
+    @return: Total bytes discarded (0 if the port was already empty).
+    '''
+    total = 0
+    empty_streak = 0
+    while empty_streak < required_empty_reads:
+        chunk = handle.read(256)
+        if chunk:
+            total += len(chunk)
+            empty_streak = 0
+        else:
+            empty_streak += 1
+    return total
+
 def isSerialDeviceString(s: str) -> bool:
     return ( ( s.count('/') + s.count('tty') ) > 0 )
 
@@ -540,10 +580,10 @@ def iscc1354p10(serialdev: str) -> bool:
         # still be delivering a previous probe's leftover response bytes
         # (already in flight over USB when the flush ran) if this port was
         # just closed and reopened by another probe a moment ago. Actively
-        # drain until genuinely empty so we don't mistake stale bytes for
-        # this ping's reply.
-        while s.read(64):
-            pass
+        # drain until genuinely empty (several consecutive empty reads, not
+        # just one - see drain_serial()'s own comment) so we don't mistake
+        # stale bytes for this ping's reply.
+        drain_serial(s)
         s.write(bytes([0xA5, 0x01, 0x00]))  # KB_SOF, CMD_PING, LEN=0
         sof = s.read(1)
         if sof != b'\xA5':
@@ -580,10 +620,10 @@ def iscc1352p7(serialdev: str) -> bool:
         # still be delivering a previous probe's leftover response bytes
         # (already in flight over USB when the flush ran) if this port was
         # just closed and reopened by another probe a moment ago. Actively
-        # drain until genuinely empty so we don't mistake stale bytes for
-        # this ping's reply.
-        while s.read(64):
-            pass
+        # drain until genuinely empty (several consecutive empty reads, not
+        # just one - see drain_serial()'s own comment) so we don't mistake
+        # stale bytes for this ping's reply.
+        drain_serial(s)
         s.write(bytes([0xA5, 0x01, 0x00]))  # KB_SOF, CMD_PING, LEN=0
         sof = s.read(1)
         if sof != b'\xA5':
