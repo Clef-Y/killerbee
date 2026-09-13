@@ -31,6 +31,7 @@ two boards specifically).
   - [Key & crypto tools](#key--crypto-tools)
   - [File conversion & analysis](#file-conversion--analysis)
   - [Interactive scapy shell](#interactive-scapy-shell)
+  - [RSSI detection (CC1354P10 + CC1352P7, every page)](#rssi-detection-this-fork-cc1354p10--cc1352p7-every-page)
   - [Sub-1GHz tools (CC1354P10)](#sub-1ghz-tools-cc1354p10)
   - [Bootloader (RZUSBSTICK only)](#bootloader-rzusbstick-only)
   - [Currently broken in this fork](#currently-broken-in-this-fork)
@@ -567,6 +568,43 @@ Usage: zbscapy [-c new_startup_file] [-p new_prestart_file] [-C] [-P] [-H]
 python3 tools/zbscapy
 >>> kbdev()
 >>> pkts = kbsniff(iface="/dev/ttyACM0", channel=11, count=20)
+```
+
+### RSSI detection (this fork, CC1354P10 + CC1352P7, every page)
+
+#### `rssi_scan.py`
+
+Ambient RSSI scanner across every KillerBee page either firmware
+supports - page 0 (2.4GHz), page 31 (915 MHz US ISM), page 28 (863-876
+MHz EU/UK) - on both the CC1354P10 and CC1352P7 (`-d`), since both now
+configure the exact same three pages/channel plans. RSSI only, no packet
+capture/pcap - built for "is something transmitting on this channel right
+now" (e.g. verifying a hop jammer running on a *different* board), not
+for capturing/decoding traffic; use `scan24.py`/`subg_scan.py` for that.
+Flags channels whose peak RSSI stands out well above that page's own
+median as likely carrying a real signal. See the script's own module
+docstring for the dwell-vs-hop-cycle aliasing caveat and the
+RF-core-stuck troubleshooting note.
+
+```
+usage: rssi_scan.py [-h] -i IFACE [-d DEVTYPE] [--pages PAGES] [-c CHANNELS]
+                     [-t DWELL] [--poll-interval POLL_INTERVAL]
+                     [--threshold THRESHOLD] [-o OUTDIR]
+
+  -i IFACE          serial device (required)
+  -d DEVTYPE        cc1354p10 (default) or cc1352p7
+  --pages           comma list of pages to scan (default: 0,28,31 - all of them)
+  -c CHANNELS       restrict to these channels, clipped per page (default: full range)
+  -t DWELL          seconds per channel (default: 0.5)
+  --poll-interval   seconds between GET_RSSI polls within a channel (default: 0.05 -
+                     keep this nonzero, see the script's module docstring)
+  --threshold       dB above a page's own median to flag as a likely signal (default: 15.0)
+  -o OUTDIR         also write a JSON report here
+```
+
+```sh
+python3 tools/rssi_scan.py -i /dev/cu.usbmodemL45003IW1 -d cc1352p7
+python3 tools/rssi_scan.py -i /dev/cu.usbmodemLS4501DC1 --pages 28 -c 9-65 -t 3
 ```
 
 ### Sub-1GHz tools (CC1354P10)
