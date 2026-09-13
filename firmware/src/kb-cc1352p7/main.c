@@ -59,6 +59,27 @@
  * dwell. JAM_HOP reuses the exact same rfJamStart()/rfJamStop() constant-
  * carrier primitives KB_CMD_JAMMER_ON already uses - only the on-chip
  * hopping loop (jamHopThread()) is new.
+ *
+ * stage 6: + KillerBee page 28, the 863-876 MHz EU/UK SRD band, channels
+ * 0-65 (863.0 + 0.2*ch MHz, 66 channels) - ported verbatim from the
+ * CC1354P10 firmware's own page 28 (same channel plan, same reasoning),
+ * so the same channel number means the same real frequency on both
+ * boards. Reuses the exact same BAND_SUBG radio setup as page 31 - no new
+ * radio config, just another rfTuneToChannel() frequency branch. Covers
+ * SET_CHANNEL/SNIFFER/INJECT/JAMMER/GET_RSSI; KB_CMD_JAM_HOP_ON (0x0C,
+ * added in stage 5) stays 2.4GHz-only and unchanged - see
+ * KB_CMD_JAM_HOP_SUBG_ON below for page 28/31 hopping instead.
+ *
+ * Also adds KB_CMD_JAM_HOP_SUBG_ON (0x0D): a second, separate on-chip hop
+ * command ported verbatim from the CC1354P10 firmware's KB_CMD_JAM_HOP_ON
+ * (0x0C there) - cross-page (page 31 and/or page 28), range-based
+ * ([page][chStart][chEnd] entries, not bare channels, for the same two
+ * reasons as that firmware: payload-size headroom for large contiguous
+ * requests, and disambiguating which page's frequency formula a channel
+ * number means). Kept as a distinct command/JAM_MODE_HOP_SUBG/hopRanges[]
+ * state from stage 5's 2.4GHz hop (JAM_MODE_HOP/hopChannels[]) rather than
+ * unifying them, since stage 5's wire format (bare channel, no page field)
+ * has no room to add page without breaking that already-shipped format.
  */
 
 #include <stdint.h>
@@ -124,6 +145,7 @@
 #define KB_CMD_RESET           0x0A
 #define KB_CMD_GET_RSSI        0x0B
 #define KB_CMD_JAM_HOP_ON      0x0C
+#define KB_CMD_JAM_HOP_SUBG_ON 0x0D
 
 #define CMD_REPLY_BIT       0x80
 #define CMD_ASYNC_PACKET    0x90
@@ -236,8 +258,12 @@ static RF_Handle rfHandle;
 static RF_CmdHandle sniffCmdHandle = RF_ALLOC_ERROR;
 
 /* BAND_24GHZ = native IEEE 802.15.4 (KillerBee page 0, channels 11-26).
- * BAND_SUBG = 915 MHz SUN O-QPSK (KillerBee page 31, channels 1-10). See
- * rfSwitchBand() for the RF_close()/RF_open() transition between them. */
+ * BAND_SUBG = the sub-1GHz radio setup, shared by both KillerBee page 31
+ * (915 MHz US ISM, channels 0-128) and page 28 (863-876 MHz EU/UK,
+ * channels 0-65, ported from the CC1354P10 firmware) - same radio setup
+ * for both, currentPage picks which frequency formula rfTuneToChannel()
+ * uses. See rfSwitchBand() for the RF_close()/RF_open() transition
+ * between BAND_24GHZ and BAND_SUBG. */
 #define BAND_24GHZ  0
 #define BAND_SUBG   1
 static uint8_t currentBand = BAND_24GHZ;
@@ -602,7 +628,15 @@ static bool rfPostAndPoll(RF_Op *op, uint16_t okStatus)
  *
  * KillerBee's own kbutils.py page-31 frequency() helper uses yet another,
  * different formula - this mapping intentionally does not match it either;
- * see README.md's Sub-1GHz support section for that caveat, still true. */
+ * see README.md's Sub-1GHz support section for that caveat, still true.
+ *
+ * Page 28 (863-876 MHz EU/UK) reuses this exact same radio setup - only
+ * the tuned frequency differs, via a separate formula (863.0 + 0.2*ch MHz,
+ * channels 0-65, 66 channels) ported verbatim from the CC1354P10
+ * firmware's page 28, so the same channel number means the same real
+ * frequency on both boards - see that firmware's README.md's "Page 28
+ * support" section for the full rationale (0.2 MHz spacing chosen to
+ * match page 31's here, for the same finer-resolution reasoning). */
 static bool rfTuneToChannel(uint8_t ch)
 {
     if (lastTuneValid && ch == lastTunedChannel) {
@@ -614,7 +648,9 @@ static bool rfTuneToChannel(uint8_t ch)
         /* Floating point (this core has an FPU; this runs once per channel
          * change, not a hot loop) to mirror TI's own conversion exactly
          * rather than approximate it with integer rounding tricks. */
-        double freqMHz = (902200.0 + 200.0 * (double)ch) / 1000.0;
+        double freqMHz = (currentPage == 28)
+                ? (863000.0 + 200.0 * (double)ch) / 1000.0
+                : (902200.0 + 200.0 * (double)ch) / 1000.0;
         double intPart = floor(freqMHz);
         double fractRaw = (freqMHz - intPart) * 65536.0;
         double fractCmd = ceil(round(fractRaw / 51.2) * 51.2);
@@ -658,6 +694,7 @@ static bool rfTransmitOnce(const uint8_t *frame, uint8_t len)
 #define JAM_MODE_CONSTANT   0x00
 #define JAM_MODE_REFLEXIVE  0x01
 #define JAM_MODE_HOP        0x02
+#define JAM_MODE_HOP_SUBG   0x03
 
 /* HISTORICAL, now fixed - kept because the diagnosis is worth keeping
  * nearby to stopJammer()'s comment: sub-1GHz constant-carrier jamming used
@@ -907,6 +944,101 @@ static bool startJamHop(void)
     return true;
 }
 
+/* On-chip rotating constant-carrier jam across a host-supplied *cross-
+ * page* sub-1GHz channel *range* list - ported verbatim from the
+ * CC1354P10 firmware's KB_CMD_JAM_HOP_ON (this firmware's KB_CMD_JAM_HOP_ON
+ * stays 2.4GHz-only from stage 5; this is the separate, sub-1GHz
+ * KB_CMD_JAM_HOP_SUBG_ON - see this file's header comment ("stage 6") for
+ * why they're kept as distinct commands/state rather than unified).
+ * Each entry is an inclusive [page][chStart][chEnd] range (not a bare
+ * channel or single [page][channel] pair): page 31 and page 28 - though
+ * both BAND_SUBG - use different rfTuneToChannel() frequency formulas, so
+ * a bare channel number would be ambiguous; and a range rather than one
+ * entry per channel is what lets a large contiguous request (e.g. 120
+ * channels) fit the wire protocol's single-byte payload-length ceiling at
+ * all - see dev_cc1354p10.py's jam_hop_on()/_collapse_to_ranges() for the
+ * host-side half of this.
+ *
+ * MAX_HOP_RANGES is the actual wire-protocol ceiling, not a conservative
+ * pick: the outer frame's payload LEN is a single byte (max 255), and
+ * this payload is a 3-byte header plus 3 bytes/range, so
+ * floor((255-3)/3) = 84 is the most this command can ever carry. */
+#define MAX_HOP_RANGES  84
+
+typedef struct {
+    uint8_t page;
+    uint8_t chStart;
+    uint8_t chEnd;  /* inclusive */
+} HopRange;
+
+static HopRange hopRanges[MAX_HOP_RANGES];
+static uint8_t hopRangeCount = 0;
+static uint32_t hopSubgDwellUs = 0;
+static volatile bool hopSubgRunning = false;
+static pthread_t hopSubgThreadHandle;
+static bool hopSubgThreadValid = false;
+
+static void *jamHopSubgThread(void *arg0)
+{
+    uint8_t rangeIdx = 0;
+    uint8_t ch = hopRanges[0].chStart;
+    bool firstHop = true;
+
+    while (hopSubgRunning) {
+        uint8_t page = hopRanges[rangeIdx].page;
+        if (page != currentPage) {
+            /* Same fix KB_CMD_SET_CHANNEL already needed: page 31 and
+             * page 28 share BAND_SUBG, so a bare channel-number match in
+             * rfTuneToChannel()'s cache check would otherwise skip a real
+             * retune across a page change that happens to land on the
+             * same raw channel number. */
+            lastTuneValid = false;
+        }
+        currentPage = page;
+        channel = ch; /* keep GET_CHANNEL accurate mid-hop */
+
+        if (!firstHop) {
+            rfJamStop();
+        }
+        rfJamStart(ch);
+        firstHop = false;
+
+        usleep(hopSubgDwellUs);
+        if (!hopSubgRunning) {
+            break;
+        }
+
+        if (ch < hopRanges[rangeIdx].chEnd) {
+            ch++;
+        } else {
+            rangeIdx = (uint8_t)((rangeIdx + 1) % hopRangeCount);
+            ch = hopRanges[rangeIdx].chStart;
+        }
+    }
+    rfJamStop();
+    return NULL;
+}
+
+/* Starts (or resumes, e.g. after KB_CMD_SET_CHANNEL stopped and is now
+ * restarting it - see startJammer()) sub-1GHz hop jamming using whatever
+ * is currently in hopRanges/hopRangeCount/hopSubgDwellUs. Always forces
+ * BAND_SUBG first since hop pages are always sub-1GHz (28/31) -
+ * rfSwitchBand() is a no-op if already on that band. */
+static bool startJamHopSubg(void)
+{
+    rfSwitchBand(BAND_SUBG);
+    hopSubgRunning = true;
+    pthread_attr_t attrs;
+    pthread_attr_init(&attrs);
+    pthread_attr_setstacksize(&attrs, 1024);
+    if (pthread_create(&hopSubgThreadHandle, &attrs, jamHopSubgThread, NULL) != 0) {
+        hopSubgRunning = false;
+        return false;
+    }
+    hopSubgThreadValid = true;
+    return true;
+}
+
 /* Stops whichever jam mode is currently active.
  *
  * Constant-carrier jamming on the sub-1GHz PHY: the original hazard here
@@ -945,6 +1077,12 @@ static void stopJammer(void)
             pthread_join(hopThreadHandle, NULL);
             hopThreadValid = false;
         }
+    } else if (jamMode == JAM_MODE_HOP_SUBG) {
+        if (hopSubgThreadValid) {
+            hopSubgRunning = false;
+            pthread_join(hopSubgThreadHandle, NULL);
+            hopSubgThreadValid = false;
+        }
     } else {
         rfJamStop();
     }
@@ -976,6 +1114,12 @@ static bool startJammer(uint8_t mode, uint8_t ch)
          * stopped hop mode and is now restarting it - ch is unused here,
          * same as the JAM_MODE_REFLEXIVE branch above ignores it). */
         return startJamHop();
+    } else if (mode == JAM_MODE_HOP_SUBG) {
+        /* hopRanges/hopRangeCount/hopSubgDwellUs are already populated -
+         * either by KB_CMD_JAM_HOP_SUBG_ON just now, or retained from an
+         * earlier call if this is a resume (ch is unused here, same as
+         * the other hop-mode branches above). */
+        return startJamHopSubg();
     }
     return rfJamStart(ch);
 }
@@ -1040,8 +1184,10 @@ static void handleCommand(uint8_t cmd, const uint8_t *payload, uint8_t len)
 
     case KB_CMD_SET_CHANNEL: {
         /* payload = [channel] (legacy, always page 0/2.4GHz) or
-         * [channel][page] (page 0 = 2.4GHz 11-26, page 31 = 915MHz SUN
-         * O-QPSK 1-10, matching KillerBee's own FREQ_915 page number). */
+         * [channel][page] (page 0 = 2.4GHz 11-26; page 31 = 915MHz SUN
+         * O-QPSK 0-128, matching KillerBee's own FREQ_915 page number;
+         * page 28 = 863-876MHz EU/UK 0-65, ported from the CC1354P10
+         * firmware - see rfTuneToChannel()'s comment). */
         if (len < 1 || len > 2) {
             sendStatus(cmd, STATUS_ERROR);
             break;
@@ -1050,9 +1196,11 @@ static void handleCommand(uint8_t cmd, const uint8_t *payload, uint8_t len)
         uint8_t newPage = (len == 2) ? payload[1] : 0;
         trace(TR_SET_CHANNEL_REQ, newPage);
         /* page 31 range is 0-128 (129 channels) - the real SUN O-QPSK
-         * Rate Mode 0 channel plan, see rfTuneToChannel()'s comment. */
+         * Rate Mode 0 channel plan; page 28 range is 0-65 (66 channels) -
+         * see rfTuneToChannel()'s comment for both. */
         bool validRange = (newPage == 0 && newChannel >= 11 && newChannel <= 26)
-                        || (newPage == 31 && newChannel <= 128);
+                        || (newPage == 31 && newChannel <= 128)
+                        || (newPage == 28 && newChannel <= 65);
         if (!validRange) {
             sendStatus(cmd, STATUS_ERROR);
             break;
@@ -1068,7 +1216,14 @@ static void handleCommand(uint8_t cmd, const uint8_t *payload, uint8_t len)
             stopJammer();
         }
 
-        bool ok = rfSwitchBand(newPage == 31 ? BAND_SUBG : BAND_24GHZ);
+        bool ok = rfSwitchBand((newPage == 31 || newPage == 28) ? BAND_SUBG : BAND_24GHZ);
+        if (newPage != currentPage) {
+            /* Page 28 and page 31 share BAND_SUBG, so rfSwitchBand() alone
+             * won't invalidate the tune cache when hopping between them at
+             * the same raw channel number (same fix the CC1354P10 firmware
+             * already needed - see its KB_CMD_SET_CHANNEL comment). */
+            lastTuneValid = false;
+        }
         channel = newChannel;
         currentPage = newPage;
 
@@ -1219,6 +1374,66 @@ static void handleCommand(uint8_t cmd, const uint8_t *payload, uint8_t len)
         hopDwellUs = (uint32_t)dwellMs * 1000u;
 
         jammerOn = startJammer(JAM_MODE_HOP, hopChannels[0]);
+        sendStatus(cmd, jammerOn ? STATUS_OK : STATUS_ERROR);
+        break;
+    }
+
+    case KB_CMD_JAM_HOP_SUBG_ON: {
+        /* payload = [dwell_ms lo][dwell_ms hi][rangeCount][page0][chStart0]
+         * [chEnd0]...[page(n-1)][chStart(n-1)][chEnd(n-1)]. Sub-1GHz only -
+         * each range must be (31, 0<=start<=end<=128) or
+         * (28, 0<=start<=end<=65) - ported verbatim from the CC1354P10
+         * firmware's KB_CMD_JAM_HOP_ON, see this file's header comment
+         * ("stage 6") and jamHopSubgThread() for why ranges rather than an
+         * explicit per-channel list, and why this is a separate command
+         * from stage 5's 2.4GHz-only KB_CMD_JAM_HOP_ON. Stopped the same
+         * way as every other jam mode: KB_CMD_JAMMER_OFF (stopJammer()
+         * already handles JAM_MODE_HOP_SUBG - no separate "off" command
+         * needed). */
+        bool badPayload = (len < 3);
+        uint8_t rangeCount = 0;
+        uint16_t dwellMs = 0;
+        if (!badPayload) {
+            memcpy(&dwellMs, &payload[0], 2);
+            rangeCount = payload[2];
+            badPayload = (dwellMs == 0 || rangeCount == 0 || rangeCount > MAX_HOP_RANGES
+                          || len != (uint8_t)(3 + 3 * rangeCount));
+        }
+        if (!badPayload) {
+            for (uint8_t i = 0; i < rangeCount; i++) {
+                uint8_t p = payload[3 + 3 * i];
+                uint8_t chStart = payload[3 + 3 * i + 1];
+                uint8_t chEnd = payload[3 + 3 * i + 2];
+                uint8_t maxCh = (p == 31) ? 128 : (p == 28) ? 65 : 0xFF;
+                bool okRange = (p == 31 || p == 28) && chStart <= chEnd && chEnd <= maxCh;
+                if (!okRange) {
+                    badPayload = true;
+                    break;
+                }
+            }
+        }
+        if (badPayload) {
+            sendStatus(cmd, STATUS_ERROR);
+            break;
+        }
+
+        if (snifferOn) {
+            rfSniffStop();
+            snifferOn = false;
+        }
+        if (jammerOn) {
+            stopJammer();
+        }
+
+        for (uint8_t i = 0; i < rangeCount; i++) {
+            hopRanges[i].page = payload[3 + 3 * i];
+            hopRanges[i].chStart = payload[3 + 3 * i + 1];
+            hopRanges[i].chEnd = payload[3 + 3 * i + 2];
+        }
+        hopRangeCount = rangeCount;
+        hopSubgDwellUs = (uint32_t)dwellMs * 1000u;
+
+        jammerOn = startJammer(JAM_MODE_HOP_SUBG, hopRanges[0].chStart);
         sendStatus(cmd, jammerOn ? STATUS_OK : STATUS_ERROR);
         break;
     }

@@ -2,8 +2,12 @@
 """
 subg_jam_hop.py - On-chip rotating constant-carrier jammer across a
 *cross-page* sub-1GHz channel list (page 31 = 915 MHz US ISM and/or page
-28 = 863-876 MHz EU/UK), using KillerBee's CC1354P10 driver's
-KBCapabilities.PHYJAM_HOP (CMD_JAM_HOP_ON).
+28 = 863-876 MHz EU/UK), using KillerBee's jam_hop_subg_on()
+(KBCapabilities.PHYJAM_HOP). Works against both the CC1354P10 (default,
+its own CMD_JAM_HOP_ON) and the CC1352P7 (-d cc1352p7, CMD_JAM_HOP_SUBG_ON
+- a separate command there since its own CMD_JAM_HOP_ON is a distinct,
+2.4GHz-only hop mode) - same channel plan on both, so the same command
+line works against either board.
 
 Same jam (constant-carrier, modulated PRBS-15 garbage - KBCapabilities.
 PHYJAM) and same cross-page rotation idea as tools/subg_jam.py's
@@ -64,8 +68,9 @@ def main() -> None:
     ap.add_argument("-i", "--iface", default="/dev/ttyACM0",
                      help="Serial device (default: /dev/ttyACM0)")
     ap.add_argument("-d", "--devtype", default="cc1354p10",
-                     help="KillerBee hardware type (default: cc1354p10 - the only "
-                          "one that currently implements on-chip sub-1GHz hop jamming)")
+                     help="KillerBee hardware type: cc1354p10 (default) or cc1352p7 "
+                          "- both implement on-chip sub-1GHz hop jamming, page 28 "
+                          "and page 31, at the same channel plan on each")
     ap.add_argument("--page-channels", action="append", required=True,
                      metavar="PAGE:CHANNELS",
                      help="'PAGE:CHANNELS' (e.g. '31:9,14,15,19,20,24,106'), "
@@ -82,7 +87,7 @@ def main() -> None:
     args = ap.parse_args()
 
     hops = parse_page_channels(args.page_channels)  # exits with an error message on anything invalid
-    # No flat-count cap here: dev_cc1354p10.jam_hop_on() collapses this
+    # No flat-count cap here: jam_hop_subg_on() collapses this
     # list into contiguous (page, start, end) ranges before sending, so a
     # large contiguous span (e.g. 9-128) costs the same 3 wire bytes as a
     # single channel - it raises its own clear error if the *collapsed*
@@ -119,7 +124,7 @@ def main() -> None:
     run_start = time.time()
     jamming = False
     try:
-        kb.jam_hop_on(hops, dwell_ms)
+        kb.jam_hop_subg_on(hops, dwell_ms)
         jamming = True
         if args.duration:
             time.sleep(args.duration)

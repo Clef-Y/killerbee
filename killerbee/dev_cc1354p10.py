@@ -108,7 +108,8 @@ CMD_ASYNC_PACKET: int = 0x90
 
 JAM_MODE_CONSTANT: int = 0x00
 JAM_MODE_REFLEXIVE: int = 0x01
-MAX_HOP_RANGES: int = 32  # matches firmware's MAX_HOP_RANGES
+MAX_HOP_RANGES: int = 84  # matches firmware's MAX_HOP_RANGES - the actual wire-protocol
+                          # ceiling (255-byte payload LEN, 3-byte header + 3 bytes/range)
 
 STATUS_OK: int = 0x00
 
@@ -516,6 +517,17 @@ class CC1354P10:
         status = self.__command(CMD_JAM_HOP_ON, payload)
         if status[0] != STATUS_OK:
             raise Exception("Device rejected jam_hop_on()")
+
+    def jam_hop_subg_on(self, hops: List[Tuple[int, int]], dwell_ms: int) -> None:
+        '''
+        Alias for jam_hop_on() - this driver's only on-chip hop mode is
+        already sub-1GHz/cross-page, so both names do exactly the same
+        thing here. Exists so generic tools (e.g. tools/subg_jam_hop.py)
+        can call jam_hop_subg_on() uniformly across this driver and
+        dev_cc1352p7.CC1352P7, which needs the distinct name since its own
+        jam_hop_on() is a different, 2.4GHz-only hop mode.
+        '''
+        return self.jam_hop_on(hops, dwell_ms)
 
     def set_sync(self, sync: int = 0xA70F) -> Any:
         self.capabilities.require(KBCapabilities.SET_SYNC)

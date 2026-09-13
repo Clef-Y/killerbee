@@ -36,8 +36,10 @@ alias.
 The sub-1GHz channel-to-frequency math (`rfTuneToChannel()`) is unchanged
 from the CC1354P10's - `CMD_FS` tunes frequency directly and is
 modulation-agnostic, so the same 902.2 + 0.2*channel MHz / 0-128 channel
-plan applies for tuning purposes regardless of which PHY preset is
-configured for RX/TX.
+plan (page 31) applies for tuning purposes regardless of which PHY preset
+is configured for RX/TX. Page 28 (863-876 MHz EU/UK, channels 0-65, 863.0
++ 0.2*channel MHz) was added later, ported verbatim from the CC1354P10's
+own page 28 for the same reason - see "On-chip channel-hop jamming" below.
 
 ## Hardware setup
 
@@ -70,15 +72,22 @@ The RF core, wire protocol, and KillerBee capabilities are otherwise
 identical to the CC1354P10 firmware's — see `../kb-cc1354p10/README.md`'s
 "Capabilities mapped to KillerBee" and "Wire protocol" sections in full,
 including 2.4GHz + sub-1GHz SNIFF/INJECT/SETCHAN/PHYJAM/PHYJAM_REFLEX/
-SELFACK/FREQ_915/GET_RSSI and the whole `0x01`-`0x0B` command set (see the
-sub-1GHz PHY difference called out above for the one real capability
-delta). Differs only in the firmware ID string (`KB-CC1352P7` instead of
-`KB-CC1354P10`), that IEEE_DONE_OK-style status codes on this device
-family come from the `cc13x2x7_cc26x2x7` driverlib headers (no dual-PAN
-command fields, but this firmware never touched those anyway), the
-sub-1GHz PHY itself (above), and one addition in the other direction:
-`0x0C`/`KB_CMD_JAM_HOP_ON` (`KBCapabilities.PHYJAM_HOP`) exists only here,
-not on the CC1354P10 - see "On-chip channel-hop jamming" below.
+SELFACK/FREQ_915/FREQ_863/FREQ_863_WIDE/GET_RSSI and the whole
+`0x01`-`0x0B` command set (see the sub-1GHz PHY difference called out
+above for the one real capability delta). Also has page 28 (863-876 MHz
+EU/UK, channels 0-65), ported verbatim from the CC1354P10's own page 28 -
+same channel plan, same reasoning, so the same channel number means the
+same real frequency on both boards. Differs only in the firmware ID
+string (`KB-CC1352P7` instead of `KB-CC1354P10`), that IEEE_DONE_OK-style
+status codes on this device family come from the `cc13x2x7_cc26x2x7`
+driverlib headers (no dual-PAN command fields, but this firmware never
+touched those anyway), the sub-1GHz PHY itself (above), and two additions
+in the other direction: `0x0C`/`KB_CMD_JAM_HOP_ON` (2.4GHz-only on-chip
+hop) exists only here, not on the CC1354P10; and `0x0D`/
+`KB_CMD_JAM_HOP_SUBG_ON` (sub-1GHz, cross-page on-chip hop) exists on
+*both* firmwares but under different command numbers (`0x0D` here,
+`0x0C` on the CC1354P10, since that one only ever needed a single hop
+command) - see "On-chip channel-hop jamming" below for both.
 
 **Known shared risk, confirmed present on this chip too:** the 2.4GHz <->
 sub-1GHz band switch (`RF_close()`+`RF_open()` in `rfSwitchBand()`) is the
@@ -146,7 +155,14 @@ Auto-detection also works (no `hardware=` needed) as long as
 default) — `KillerBee()` will probe serial devices with
 `kbutils.iscc1352p7()`.
 
-## On-chip channel-hop jamming (`KBCapabilities.PHYJAM_HOP`, CC1352P7 only)
+## On-chip channel-hop jamming (`KBCapabilities.PHYJAM_HOP`)
+
+This firmware has *two* on-chip hop commands - `CMD_JAM_HOP_ON` (2.4GHz,
+below) and `CMD_JAM_HOP_SUBG_ON` (sub-1GHz cross-page, further down) - kept
+separate since the 2.4GHz one's wire format (bare channel, no page field)
+predates page 28 support and has no room to add one without breaking it.
+
+### 2.4GHz (`CMD_JAM_HOP_ON`, 0x0C)
 
 `CMD_JAM_HOP_ON` (0x0C) starts a constant-carrier jam that rotates across a
 host-supplied 2.4GHz channel list (page 0, channels 11-26) entirely inside
@@ -208,6 +224,58 @@ baseline. Confirms real, on-air hopping across exactly the given channels,
 not just a firmware state machine that doesn't crash. Also ran a
 sustained 20-second/~125-cycle continuous hop with no degradation and a
 healthy board immediately after.
+
+### Sub-1GHz, cross-page (`CMD_JAM_HOP_SUBG_ON`, 0x0D)
+
+Ported verbatim from the CC1354P10 firmware's `CMD_JAM_HOP_ON` (its only
+hop command, since it has no 2.4GHz hop to collide with) - same
+cross-page design (page 31 and/or page 28), same reason each entry is an
+inclusive `[page][chStart][chEnd]` range rather than a bare channel or
+`[page][channel]` pair: the two pages share `BAND_SUBG` but use different
+`rfTuneToChannel()` frequency formulas at the same raw channel number, and
+ranges (not one entry per channel) are what let a large contiguous
+request fit the wire protocol's single-byte payload-length ceiling at
+all. See `../kb-cc1354p10/README.md`'s own "On-chip channel-hop jamming"
+section for the full design writeup - it applies here unchanged, just
+under command number `0x0D` instead of `0x0C` (this firmware's `0x0C` is
+already taken by the 2.4GHz hop above).
+
+```python
+kb.jam_hop_subg_on([(31, 9), (31, 14), (28, 10), ...], dwell_ms=20)
+time.sleep(10)
+kb.jammer_off()
+```
+
+or via `tools/subg_jam_hop.py` (same tool the CC1354P10 uses - just pass
+`-d cc1352p7`):
+
+```sh
+python3 tools/subg_jam_hop.py -i /dev/cu.usbmodemL45003IW1 -d cc1352p7 --dwell 0.02 \
+    --page-channels 28:9-65
+```
+
+`MAX_HOP_RANGES` is 84 here too - the actual wire-protocol ceiling (a
+255-byte payload cap, 3-byte header + 3 bytes/range), not an arbitrary
+pick; a single-range full-page request only ever needs 1 of the 84.
+
+**Hardware-validated with real RF evidence, including closing a gap left
+open on the CC1354P10 side.** Command-level: `JAM_HOP_SUBG_ON` accepted
+for a `(28, 9, 65)` range, device stays fully responsive to
+`PING`/`GET_CHANNEL` while hopping (`GET_CHANNEL` mid-hop correctly
+reported a real in-progress channel within the range), `JAMMER_OFF` stops
+it cleanly, and an out-of-range page (page 0) is correctly rejected with
+`STATUS_ERROR`. Beyond that: this board's own new page 28 support (above)
+was used as the independent RF monitor for the CC1354P10's page 28
+`JAM_HOP_ON` - something the CC1354P10 README's own validation explicitly
+couldn't do yet ("no second board here can tune there"). With the
+CC1354P10 hopping page 28 channels 9-65, this board's `GET_RSSI` (via
+`SET_CHANNEL`/`SNIFFER_ON` at page 28) showed a strong, repeatable spike
+(~-62 to -64 dBm) on every sampled in-range channel (9, 20, 30, 40, 50,
+65 - spanning the full requested range including both endpoints) against
+a ~-108 to -115 dBm noise floor on channels 0 and 5 (valid page 28
+channels, but outside the jammed 9-65 range) - confirming genuine on-air
+hopping across the full range on both boards' page 28 implementations at
+once.
 
 ## Validation status
 

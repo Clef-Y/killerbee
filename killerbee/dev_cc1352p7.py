@@ -28,7 +28,10 @@ Wire protocol is identical to the CC1354P10's (921600 8N1):
                          frequency independent of modulation/PHY preset;
                          NOTE this chip's sub-1GHz PHY is FSK-based
                          Wi-SUN, not the CC1354P10's O-QPSK - see
-                         firmware/src/kb-cc1352p7/README.md).
+                         firmware/src/kb-cc1352p7/README.md); page 28 =
+                         863-876MHz EU/UK (channel 0-65, 863.0 +
+                         0.2*channel MHz - ported verbatim from the
+                         CC1354P10's page 28, same channel plan).
   CMD_SNIFFER_ON   0x04  -> reply [status]
   CMD_SNIFFER_OFF  0x05  -> reply [status]
   CMD_INJECT       0x06  payload=[count][delay_ms lo][delay_ms hi][frame...]
@@ -52,6 +55,21 @@ Wire protocol is identical to the CC1354P10's (921600 8N1):
                          firmware/src/kb-cc1352p7/README.md's "On-chip
                          channel-hop jamming" section for why this exists.
                          Stopped with the existing CMD_JAMMER_OFF.
+  CMD_JAM_HOP_SUBG_ON
+                   0x0D  payload=[dwell_ms lo][dwell_ms hi][rangeCount]
+                         [page0][chStart0][chEnd0]...
+                         [page(n-1)][chStart(n-1)][chEnd(n-1)]
+                         -> reply [status]. Sub-1GHz only (page 31 and/or
+                         page 28) - each range must be (31, 0<=start<=
+                         end<=128) or (28, 0<=start<=end<=65). Same idea
+                         as CMD_JAM_HOP_ON but cross-page and sub-1GHz -
+                         ported verbatim from the CC1354P10 firmware's
+                         CMD_JAM_HOP_ON (0x0C there). Kept as a separate
+                         command from this firmware's own CMD_JAM_HOP_ON
+                         (0x0C, 2.4GHz-only) rather than unified, since
+                         that one's wire format has no page field to add
+                         without breaking it. Stopped with the existing
+                         CMD_JAMMER_OFF.
 
   Async packet (CMD 0x90) payload:
       [rssi int8][crc_ok uint8][timestamp uint32 LE][framelen uint8][frame...]
@@ -62,7 +80,7 @@ See firmware/src/kb-cc1352p7/README.md for the full protocol writeup and
 the RF-core command semantics behind each operation.
 '''
 
-from typing import Optional, Dict, Union, Any, List
+from typing import Optional, Dict, Union, Any, List, Tuple
 
 import struct
 import time
@@ -86,6 +104,7 @@ CMD_SET_SELFACK: int = 0x09
 CMD_RESET: int = 0x0A
 CMD_GET_RSSI: int = 0x0B
 CMD_JAM_HOP_ON: int = 0x0C
+CMD_JAM_HOP_SUBG_ON: int = 0x0D
 
 RF_GET_RSSI_ERROR_VAL: int = -128
 
@@ -95,6 +114,9 @@ CMD_ASYNC_PACKET: int = 0x90
 JAM_MODE_CONSTANT: int = 0x00
 JAM_MODE_REFLEXIVE: int = 0x01
 MAX_HOP_CHANNELS: int = 16  # matches firmware's exact 2.4GHz channel count (11-26)
+MAX_HOP_RANGES: int = 84  # matches firmware's MAX_HOP_RANGES for CMD_JAM_HOP_SUBG_ON -
+                          # the actual wire-protocol ceiling (255-byte payload LEN,
+                          # 3-byte header + 3 bytes/range)
 
 STATUS_OK: int = 0x00
 
@@ -139,10 +161,18 @@ class CC1352P7:
     def __set_capabilities(self) -> None:
         self.capabilities.setcapab(KBCapabilities.FREQ_2400, True)
         self.capabilities.setcapab(KBCapabilities.FREQ_900, False)
-        self.capabilities.setcapab(KBCapabilities.FREQ_863, False)
         self.capabilities.setcapab(KBCapabilities.FREQ_868, False)
         self.capabilities.setcapab(KBCapabilities.FREQ_870, False)
         self.capabilities.setcapab(KBCapabilities.FREQ_915, True)
+        # 863-876 MHz EU/UK, channels 0-65 (863.0 + 0.2*channel MHz) -
+        # ported verbatim from the CC1354P10's page 28, same reasoning for
+        # both FREQ_863 and FREQ_863_WIDE - see that driver's
+        # __set_capabilities() comment for why both flags are needed
+        # (FREQ_863_WIDE unlocks KillerBee.set_channel()'s full 0-65 range
+        # at the generic capabilities-check layer without disturbing older
+        # Silabs page-28 hardware's narrower, differently-encoded range).
+        self.capabilities.setcapab(KBCapabilities.FREQ_863, True)
+        self.capabilities.setcapab(KBCapabilities.FREQ_863_WIDE, True)
 
         self.capabilities.setcapab(KBCapabilities.SNIFF, True)
         self.capabilities.setcapab(KBCapabilities.SETCHAN, True)
@@ -150,9 +180,13 @@ class CC1352P7:
         self.capabilities.setcapab(KBCapabilities.SELFACK, True)
         self.capabilities.setcapab(KBCapabilities.PHYJAM, True)
         self.capabilities.setcapab(KBCapabilities.PHYJAM_REFLEX, True)
-        # On-chip channel-hop jamming (CMD_JAM_HOP_ON) - 2.4GHz only, see
-        # firmware/src/kb-cc1352p7/README.md's "On-chip channel-hop
-        # jamming" section. Not yet added to the CC1354P10 firmware.
+        # On-chip channel-hop jamming: CMD_JAM_HOP_ON (2.4GHz, jam_hop_on())
+        # and CMD_JAM_HOP_SUBG_ON (sub-1GHz cross-page, jam_hop_subg_on())
+        # - see firmware/src/kb-cc1352p7/README.md's "On-chip channel-hop
+        # jamming" section. This single flag covers both; check which
+        # method to call based on the band you want (jam_hop_on() also
+        # exists on dev_cc1354p10.py, but for its sub-1GHz-only hop - see
+        # that driver's own jam_hop_on() docstring for the difference).
         self.capabilities.setcapab(KBCapabilities.PHYJAM_HOP, True)
         # The native IEEE 802.15.4 RX/TX radio commands use a fixed,
         # standard-compliant O-QPSK preamble/SFD - there is no register to
@@ -288,8 +322,15 @@ class CC1352P7:
                                  'the CC1354P10; this chip uses a Wi-SUN FSK PHY instead '
                                  'of O-QPSK for RX/TX, see firmware/src/kb-cc1352p7/'
                                  'README.md)')
+        elif page == 28:
+            self.capabilities.require(KBCapabilities.FREQ_863)
+            if channel < 0 or channel > 65:
+                raise Exception('Invalid channel (must be 0-65 for the 863-876 MHz EU/UK '
+                                 'band - 863.0 + 0.2*channel MHz, ported verbatim from the '
+                                 'CC1354P10\'s page 28, same channel plan)')
         else:
-            raise Exception('Unsupported page %d - only 0 (2.4 GHz) and 31 (915 MHz) exist on this device' % page)
+            raise Exception('Unsupported page %d - only 0 (2.4 GHz), 28 (863-876 MHz EU/UK) '
+                             'and 31 (915 MHz US ISM) exist on this device' % page)
         status = self.__command(CMD_SET_CHANNEL, bytes([channel, page]))
         if status[0] != STATUS_OK:
             raise Exception("Device rejected channel %d (page %d)" % (channel, page))
@@ -414,6 +455,78 @@ class CC1352P7:
         status = self.__command(CMD_JAM_HOP_ON, payload)
         if status[0] != STATUS_OK:
             raise Exception("Device rejected jam_hop_on()")
+
+    @staticmethod
+    def _collapse_to_ranges(hops: List[Tuple[int, int]]) -> List[Tuple[int, int, int]]:
+        '''
+        Collapses a flat (page, channel) hop list into (page, chStart,
+        chEnd) inclusive ranges wherever consecutive entries share the
+        same page and increment by exactly 1 - ported verbatim from
+        dev_cc1354p10.py's CC1354P10._collapse_to_ranges(), see there for
+        the full rationale (wire-payload size for large contiguous
+        requests).
+        '''
+        if not hops:
+            return []
+        ranges: List[Tuple[int, int, int]] = []
+        curPage, start = hops[0]
+        end = start
+        for page, ch in hops[1:]:
+            if page == curPage and ch == end + 1:
+                end = ch
+            else:
+                ranges.append((curPage, start, end))
+                curPage, start, end = page, ch, ch
+        ranges.append((curPage, start, end))
+        return ranges
+
+    def jam_hop_subg_on(self, hops: List[Tuple[int, int]], dwell_ms: int) -> None:
+        '''
+        Starts a constant-carrier jam that hops across the given
+        *cross-page* sub-1GHz channel list entirely on-chip - no host
+        round-trip per hop. Ported from the CC1354P10 firmware's
+        jam_hop_on() (that driver's sub-1GHz-only hop) - see
+        firmware/src/kb-cc1352p7/README.md's "On-chip channel-hop jamming"
+        section for why this is a separate method/command from this
+        chip's own 2.4GHz-only jam_hop_on(). Stop with jammer_off() - the
+        same command that stops every other jam mode.
+        @param hops: List of (page, channel) tuples, in hop order. page
+            must be 31 (channel 0-128) or 28 (channel 0-65) - 2.4GHz
+            (page 0) is not supported by this on-chip hop command;
+            use jam_hop_on() for that instead. Each entry carries its own
+            page (not a bare channel) since page 31 and page 28 use
+            different frequency formulas at the same raw channel number.
+            Internally collapsed into contiguous (page, start, end) ranges
+            before sending - see _collapse_to_ranges() - so there is no
+            small, fixed cap on len(hops) itself.
+        @param dwell_ms: milliseconds to jam each channel before hopping to
+            the next (1-65535).
+        '''
+        self.capabilities.require(KBCapabilities.PHYJAM_HOP)
+        if not hops:
+            raise Exception('hops must be a non-empty list of (page, channel) tuples')
+        for page, ch in hops:
+            okPair = (page == 31 and 0 <= ch <= 128) or (page == 28 and 0 <= ch <= 65)
+            if not okPair:
+                raise Exception('Invalid (page=%d, channel=%d) - must be '
+                                 '(31, 0-128) or (28, 0-65); 2.4GHz (page 0) is '
+                                 'not supported by this on-chip hop command '
+                                 '(use jam_hop_on() instead)' % (page, ch))
+        if dwell_ms < 1 or dwell_ms > 0xFFFF:
+            raise Exception('dwell_ms must be 1-65535')
+
+        ranges = self._collapse_to_ranges(hops)
+        if len(ranges) > MAX_HOP_RANGES:
+            raise Exception('hops collapses to %d contiguous ranges, more than the '
+                             'firmware supports (%d) - try fewer distinct/scattered '
+                             'spans' % (len(ranges), MAX_HOP_RANGES))
+
+        payload = struct.pack('<HB', dwell_ms, len(ranges))
+        for page, chStart, chEnd in ranges:
+            payload += bytes([page, chStart, chEnd])
+        status = self.__command(CMD_JAM_HOP_SUBG_ON, payload)
+        if status[0] != STATUS_OK:
+            raise Exception("Device rejected jam_hop_subg_on()")
 
     def set_sync(self, sync: int = 0xA70F) -> Any:
         self.capabilities.require(KBCapabilities.SET_SYNC)

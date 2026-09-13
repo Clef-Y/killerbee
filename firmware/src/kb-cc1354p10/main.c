@@ -895,8 +895,16 @@ static void *reflexJamThread(void *arg0)
  * long one, same as before in total payload cost. This host-side
  * collapsing (contiguous runs -> ranges) happens in
  * dev_cc1354p10.py's jam_hop_on(), not here - this firmware only ever
- * sees already-collapsed ranges. */
-#define MAX_HOP_RANGES  32
+ * sees already-collapsed ranges.
+ *
+ * MAX_HOP_RANGES is the actual wire-protocol ceiling, not a conservative
+ * pick: the outer frame's payload LEN is a single byte (max 255), and
+ * this payload is a 3-byte header plus 3 bytes/range, so
+ * floor((255-3)/3) = 84 is the most this command can ever carry - there
+ * is no smaller, more "reasonable" limit to impose on top of that (a
+ * single-range full-page request, e.g. page 31 channels 0-128, only ever
+ * needs 1 of the 84). */
+#define MAX_HOP_RANGES  84
 
 typedef struct {
     uint8_t page;

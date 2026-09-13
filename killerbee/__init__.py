@@ -512,3 +512,27 @@ class KillerBee:
 
         return self.driver.jam_hop_on(channels, dwell_ms)
 
+    def jam_hop_subg_on(self, hops: List[Any], dwell_ms: int) -> None:
+        '''
+        Starts a constant-carrier jam that hops across the given
+        *cross-page* sub-1GHz channel list entirely on-chip (no host
+        round-trip per hop) - see KBCapabilities.PHYJAM_HOP. Stop with
+        jammer_off(). Implemented by both dev_cc1352p7.CC1352P7 (whose own
+        jam_hop_on() is a separate, 2.4GHz-only hop mode, hence this
+        distinct method/command) and dev_cc1354p10.CC1354P10 (whose
+        jam_hop_subg_on() is just an alias for its jam_hop_on(), since
+        sub-1GHz/cross-page is that driver's only hop mode) - call this
+        one when you want the sub-1GHz hop regardless of which board it is.
+        @type hops: List of (page, channel) Tuples
+        @param hops: (page, channel) pairs to hop across - page 31 (0-128)
+            or 28 (0-65).
+        @type dwell_ms: Integer
+        @param dwell_ms: Milliseconds to jam each channel before hopping.
+        @rtype: None
+        '''
+
+        if self.driver is None:
+            raise KBInterfaceError("Driver not configured")
+
+        return self.driver.jam_hop_subg_on(hops, dwell_ms)
+

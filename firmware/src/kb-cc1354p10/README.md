@@ -680,16 +680,21 @@ entire requested range on both pages (page 28: the full 9-65; page 31:
 9-127 directly sampled, 128 confirmed separately as above) over repeated
 polling across a full ~3.5s hop cycle, ruling out silent truncation.
 Beyond that: verified with an independent RF energy check using a second
-board (CC1352P7, which also supports page 31 - though not page 28) doing
-ambient RSSI sampling (`GET_RSSI` while sniffing) on each page-31 target
-channel while this one hopped the (13-entry) cross-page list at 20ms
-dwell - every page-31 channel in the list showed a clear spike (~-77 to
--87 dBm) against a much quieter ~-105 to -119 dBm baseline on channels
-*not* in the list, confirming real, on-air hopping (the page-28 portion
-isn't independently RF-verifiable this
-way since no second board here can tune there, but the same
-`rfTuneToChannel()`/`rfJamStart()` code path already validated for page 28
-elsewhere, plus the `GET_CHANNEL` mid-hop evidence above, cover it).
+board (CC1352P7) doing ambient RSSI sampling (`GET_RSSI` while sniffing)
+on each page-31 target channel while this one hopped the (13-entry)
+cross-page list at 20ms dwell - every page-31 channel in the list showed a
+clear spike (~-77 to -87 dBm) against a much quieter ~-105 to -119 dBm
+baseline on channels *not* in the list, confirming real, on-air hopping.
+
+**The page-28 gap this left open has since been closed**: the CC1352P7
+firmware gained its own page 28 support (ported verbatim from this one)
+specifically so it could serve as an independent RF monitor here too. With
+this firmware hopping page 28 channels 9-65, the CC1352P7's `GET_RSSI`
+showed the same kind of clear, repeatable spike (~-62 to -64 dBm) on every
+sampled in-range channel (9, 20, 30, 40, 50, 65 - the full range including
+both endpoints) against a much quieter baseline on channels outside the
+jammed range - see `../kb-cc1352p7/README.md`'s own "On-chip channel-hop
+jamming" section for the full writeup.
 
 ## Wire protocol
 
