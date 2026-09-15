@@ -95,8 +95,8 @@ same "unreliable blocking wait" the CC1354P10's README documents as an
 accepted risk, not a solved problem. Reproduced directly on this board
 during validation: one `SET_CHANNEL` call switching bands right after a
 2.4GHz reflexive-jam cycle hung the board solid (no self-recovery, cleared
-by the same `dslite.sh --mode memory` JTAG nudge documented in the
-CC1354P10 README's troubleshooting section) - but a retry of the identical
+by the same JTAG nudge documented in the CC1354P10 README's
+troubleshooting section, `tools/kb_jtag_recover.sh cc1352p7`) - but a retry of the identical
 command immediately after recovery succeeded cleanly, and every other band
 switch performed during validation worked fine. Intermittent, not
 deterministic, consistent with the CC1354P10's own characterization of

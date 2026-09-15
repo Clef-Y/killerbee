@@ -830,8 +830,14 @@ an external JTAG-level board reset through the debug probe has the same
 effect and needs no reflash:
 
 ```sh
-/opt/ti/uniflash_sl/dslite.sh --mode memory \
-    -c firmware/src/kb-cc1354p10/CC1354P10_XDS110.ccxml -r 0x0,4 -o /tmp/discard.bin -e
+tools/kb_jtag_recover.sh cc1354p10
+```
+
+That wraps:
+
+```sh
+dslite.sh --mode memory \
+    -c firmware/src/kb-cc1354p10/CC1354P10_XDS110.ccxml -r 0x0,4 -o <tmpfile> -e
 ```
 
 (Any DSLite operation that connects and does its usual GEL-script board

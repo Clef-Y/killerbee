@@ -23,6 +23,7 @@ two boards specifically).
 - [Setup](#setup)
 - [Supported hardware](#supported-hardware)
 - [Quick start](#quick-start)
+- [CLI usage by board (CC1352P7 vs CC1354P10)](#cli-usage-by-board-cc1352p7-vs-cc1354p10)
 - [CLI tools reference](#cli-tools-reference)
   - [Device discovery](#device-discovery)
   - [Capture & replay](#capture--replay)
@@ -31,8 +32,9 @@ two boards specifically).
   - [Key & crypto tools](#key--crypto-tools)
   - [File conversion & analysis](#file-conversion--analysis)
   - [Interactive scapy shell](#interactive-scapy-shell)
+  - [2.4GHz full-band scan (this fork, CC1352P7 / CC1354P10)](#24ghz-full-band-scan-this-fork-cc1352p7--cc1354p10)
   - [RSSI detection (CC1354P10 + CC1352P7, every page)](#rssi-detection-this-fork-cc1354p10--cc1352p7-every-page)
-  - [Sub-1GHz tools (CC1354P10)](#sub-1ghz-tools-cc1354p10)
+  - [Sub-1GHz tools (CC1354P10 + CC1352P7)](#sub-1ghz-tools-cc1354p10--cc1352p7)
   - [Bootloader (RZUSBSTICK only)](#bootloader-rzusbstick-only)
   - [Currently broken in this fork](#currently-broken-in-this-fork)
 - [Python library usage](#python-library-usage)
@@ -107,6 +109,127 @@ python3 tools/zbdump -i /dev/ttyACM0 -d cc1354p10 -c 11 -n 100 -w capture.pcap
 # Replay that capture from a second device
 python3 tools/zbreplay -i /dev/ttyACM2 -r capture.pcap -c 11 -n 20 -s 0.1
 ```
+
+See [CLI usage by board](#cli-usage-by-board-cc1352p7-vs-cc1354p10) below
+for a per-board command cheat sheet, or [CLI tools reference](#cli-tools-reference)
+for the full per-tool flag docs.
+
+---
+
+## CLI usage by board (CC1352P7 vs CC1354P10)
+
+Every tool takes `-i/--iface` (serial device) and, since this fork's two
+custom boards share driver code, `-d/--devtype` (hardware type - most
+tools default to `cc1354p10`; a few 2.4GHz-hop-specific ones default to
+`cc1352p7`, noted below). This section pulls together the commands most
+relevant to *each board specifically* into one place; see
+[CLI tools reference](#cli-tools-reference) for full flag docs on any tool
+used below, and [Supported hardware](#supported-hardware) for what each
+board can do.
+
+Both boards enumerate as two ports (`/dev/cu.usbmodem*`/`/dev/tty.usbmodem*`
+on macOS, `/dev/ttyACM*` on Linux) - one debug/CMSIS-DAP, one the real
+KillerBee UART. Run `zbid` to find yours; the paths below
+(`L45003IW*`/`LS4501DC*`) are this project's own two dev boards, kept
+consistent with the examples in each firmware's README.
+
+### CC1352P7 (`-d cc1352p7`)
+
+TI CC1352P7 LaunchPad, **onboard** XDS110 debug probe (single USB cable).
+Bands: 2.4GHz (channels 11-26) and sub-1GHz page 31 (915 MHz US ISM) +
+page 28 (863-876 MHz EU/UK). This is the only board with an on-chip
+2.4GHz hop-jam mode (`jam24_hop.py`) - the CC1354P10 has no 2.4GHz/page-0
+support at all, on-chip-hop or otherwise.
+
+```sh
+# Device discovery
+python3 tools/zbid
+
+# 2.4GHz sniff -> pcap
+python3 tools/zbdump -i /dev/cu.usbmodemL45003IW1 -d cc1352p7 -c 11 -w capture.pcap -n -1
+
+# 2.4GHz full-band scan (channels 11-26) + ambient RSSI, report + per-channel pcaps
+python3 tools/scan24.py -i /dev/cu.usbmodemL45003IW1 -d cc1352p7
+
+# 2.4GHz rotating jam, host-driven (~30ms/hop control-plane floor)
+python3 tools/jam24_rotate.py -i /dev/cu.usbmodemL45003IW1 -d cc1352p7 -c 11,25 --dwell 5
+
+# 2.4GHz on-chip hop jam (CC1352P7-only capability - fast dwell, no host round trip)
+python3 tools/jam24_hop.py -i /dev/cu.usbmodemL45003IW1 -d cc1352p7 \
+    -c 11,12,13,14,15,20,22,26 --dwell 0.02
+
+# Sub-1GHz page 31 (915 MHz) scan
+python3 tools/subg_scan.py -i /dev/cu.usbmodemL45003IW1 -d cc1352p7 -p 31 -c 0-9
+
+# Sub-1GHz page 28 (863-876 MHz EU/UK) scan
+python3 tools/subg_scan.py -i /dev/cu.usbmodemL45003IW1 -d cc1352p7 -p 28 -c 0-65 -t 10
+
+# Sub-1GHz rotating jam, page 28
+python3 tools/subg_jam.py -i /dev/cu.usbmodemL45003IW1 -d cc1352p7 -p 28 -c 0,13,26,39,52,65 --dwell 2
+
+# Sub-1GHz on-chip cross-page hop jam, page 28
+python3 tools/subg_jam_hop.py -i /dev/cu.usbmodemL45003IW1 -d cc1352p7 --dwell 0.02 --page-channels 28:9-65
+
+# Ambient RSSI across every page this board supports (0, 28, 31)
+python3 tools/rssi_scan.py -i /dev/cu.usbmodemL45003IW1 -d cc1352p7
+
+# JTAG recovery if a command gets rejected or the UART stops responding
+tools/kb_jtag_recover.sh cc1352p7
+```
+
+### CC1354P10 (`-d cc1354p10`, this fork's default/primary hardware)
+
+TI CC1354P10 + standalone LP-XDS110 debug probe (two-cable setup - no
+onboard probe). Bands: 2.4GHz (11-26) and sub-1GHz page 31 (915 MHz US
+ISM) + page 28 (863-876 MHz EU/UK). `-d cc1354p10` is every tool's
+default, so it's omittable below; shown explicitly for symmetry with the
+CC1352P7 examples above.
+
+```sh
+python3 tools/zbid
+
+# 2.4GHz sniff -> pcap
+python3 tools/zbdump -i /dev/cu.usbmodemLS4501DC1 -d cc1354p10 -c 11 -w capture.pcap -n -1
+
+# 2.4GHz full-band scan (channels 11-26) + ambient RSSI
+python3 tools/scan24.py -i /dev/cu.usbmodemLS4501DC1 -d cc1354p10
+
+# 2.4GHz rotating jam, host-driven - no on-chip 2.4GHz hop mode on this
+# board, so use jam24_rotate.py, not jam24_hop.py (that one's CC1352P7-only)
+python3 tools/jam24_rotate.py -i /dev/cu.usbmodemLS4501DC1 -d cc1354p10 -c 11,25 --dwell 5
+
+# Sub-1GHz page 31 (915 MHz) scan
+python3 tools/subg_scan.py -i /dev/cu.usbmodemLS4501DC1 -d cc1354p10 -p 31 -c 0-9
+
+# Sub-1GHz page 28 (863-876 MHz EU/UK) scan
+python3 tools/subg_scan.py -i /dev/cu.usbmodemLS4501DC1 -d cc1354p10 -p 28 -c 0-65 -t 10
+
+# Sub-1GHz rotating jam, both pages in one run
+python3 tools/subg_jam.py -i /dev/cu.usbmodemLS4501DC1 -d cc1354p10 --dwell 0.03 \
+    --page-channels 31:9,14,15,19,20,24,106 \
+    --page-channels 28:10,12,20,41,51,57
+
+# Sub-1GHz on-chip cross-page hop jam, both pages in one run
+python3 tools/subg_jam_hop.py -i /dev/cu.usbmodemLS4501DC1 -d cc1354p10 --dwell 0.02 \
+    --page-channels 31:9,14,15,19,20,24,106 \
+    --page-channels 28:10,12,20,41,51,57
+
+# Sub-1GHz sweep + lock-on tracker
+python3 tools/subg_track.py -i /dev/cu.usbmodemLS4501DC1 -d cc1354p10 -c 0-24 --sweep-dwell 0.2
+
+# Ambient RSSI across every page this board supports (0, 28, 31)
+python3 tools/rssi_scan.py -i /dev/cu.usbmodemLS4501DC1 -d cc1354p10
+
+# JTAG recovery if a command gets rejected or the UART stops responding
+tools/kb_jtag_recover.sh cc1354p10
+```
+
+**Cross-board validation tip:** both boards implement the identical page
+28/31 channel plans, so one board's `rssi_scan.py` (or `subg_scan.py`)
+makes an independent RF monitor for a jammer running on the *other*
+board - exactly how this project's own on-chip hop-jamming features were
+hardware-validated. See each firmware's README ("Validation status"
+section) for the real measurements this produced.
 
 ---
 
@@ -314,41 +437,14 @@ python3 tools/jam24_hop.py -i /dev/cu.usbmodemL45003IW1 -c 11,12,13,14,15,20,22,
 python3 tools/jam24_hop.py -c 11,15,20,25 --dwell 0.05 --duration 30
 ```
 
-#### `subg_jam.py` (this fork, CC1354P10, sub-1GHz)
+#### `subg_jam.py` / `subg_jam_hop.py` (this fork, CC1354P10 + CC1352P7, sub-1GHz)
 
-Same idea as `jam24_rotate.py` but for the 902-928 MHz band. See
-[Sub-1GHz tools](#sub-1ghz-tools-cc1354p10) below.
-
-#### `subg_jam_hop.py` (this fork, CC1354P10, sub-1GHz)
-
-Same jam as `subg_jam.py`, but the hop loop runs entirely on-chip
-(`KBCapabilities.PHYJAM_HOP`) instead of the host calling `SET_CHANNEL`
-once per hop - same measured ~30ms-per-hop control-plane tax this removes
-as `jam24_hop.py` does for 2.4GHz (see that entry above). Sub-1GHz only,
-and supports hopping across *both* page 31 (915 MHz) and page 28
-(863-876 MHz) in a single run via repeatable `--page-channels
-PAGE:CHANNELS`, same syntax `subg_jam.py` uses. See
-firmware/src/kb-cc1354p10/README.md's "On-chip channel-hop jamming"
-section for the full measurement, cross-page design notes, and hardware
-validation (including an independent RF-energy check).
-
-```
-usage: subg_jam_hop.py [-h] [-i IFACE] [-d DEVTYPE] --page-channels PAGE:CHANNELS
-                        [--dwell DWELL] [--duration DURATION]
-
-  -i IFACE            serial device (default: /dev/ttyACM0)
-  -d DEVTYPE          hardware type (default: cc1354p10)
-  --page-channels     'PAGE:CHANNELS' (e.g. '31:9,14,15,19,20,24,106'),
-                       repeatable - one per page (28 and/or 31) (required)
-  --dwell             seconds per channel before hopping (default: 0.02 = 20ms)
-  --duration          stop after N seconds total (default: 0 = unbounded, Ctrl+C)
-```
-
-```sh
-python3 tools/subg_jam_hop.py -i /dev/cu.usbmodemLS4501DC1 --dwell 0.02 \
-    --page-channels 31:9,14,15,19,20,24,106 \
-    --page-channels 28:10,12,20,41,51,57
-```
+Same host-driven-rotation vs. on-chip-hop split as `jam24_rotate.py` vs.
+`jam24_hop.py` above, but for the sub-1GHz pages (31 = 915 MHz, 28 =
+863-876 MHz EU/UK) - and, unlike the 2.4GHz pair, both variants here work
+against *either* board (`-d cc1352p7` or the default `cc1354p10`), and
+both can hop across both pages in a single run. Full flag docs and
+examples: [Sub-1GHz tools](#sub-1ghz-tools-cc1354p10--cc1352p7) below.
 
 ### Attack / flood tools
 
@@ -570,6 +666,43 @@ python3 tools/zbscapy
 >>> pkts = kbsniff(iface="/dev/ttyACM0", channel=11, count=20)
 ```
 
+### 2.4GHz full-band scan (this fork, CC1352P7 / CC1354P10)
+
+#### `scan24.py`
+
+2.4GHz analog of `subg_scan.py` (below) - same output shape, same
+rationale for every design choice; only the band, channel plan, and
+default channel range differ. Scans a channel list (default 11-26, the
+full real IEEE 802.15.4 2.4GHz plan, `2405 + 5*(channel-11)` MHz), each
+for a configurable dwell, and writes a per-channel pcap for any channel
+that saw traffic (quiet channels are left out, not written as empty
+header-only files), a text report, and a JSON results file. Also samples
+ambient RSSI per channel independent of packet capture, so a channel with
+real RF energy but no decodable 802.15.4 traffic is still distinguishable
+from a genuinely dead one.
+
+```
+usage: scan24.py [-h] [-i IFACE] [-d DEVTYPE] [-t DWELL] [-c CHANNELS]
+                 [-o OUTDIR] [--rssi-interval RSSI_INTERVAL] [--no-rssi]
+
+  -i IFACE, --iface IFACE           serial device (default: /dev/ttyACM0)
+  -d DEVTYPE, --devtype DEVTYPE     hardware type (default: cc1354p10)
+  -t DWELL, --dwell DWELL           seconds to listen per channel (default: 20)
+  -c CHANNELS, --channels CHANNELS  channel spec, e.g. '11-26' or
+                                     '11,15,20,25' (default: 11-26)
+  -o OUTDIR, --outdir OUTDIR        output directory (default: ./scan24_<timestamp>)
+  --rssi-interval RSSI_INTERVAL     seconds between ambient RSSI samples (default: 1.0)
+  --no-rssi                         disable ambient RSSI sampling (packet capture only)
+```
+
+```sh
+# Default: channels 11-26, 20s each, into ./scan24_<timestamp>/
+python3 tools/scan24.py -i /dev/cu.usbmodemL45003IW1 -d cc1352p7
+
+# 60s dwell, only channels 11, 15, 20, 25
+python3 tools/scan24.py -i /dev/cu.usbmodemLS4501DC1 -t 60 -c 11,15,20,25
+```
+
 ### RSSI detection (this fork, CC1354P10 + CC1352P7, every page)
 
 #### `rssi_scan.py`
@@ -587,13 +720,15 @@ docstring for the dwell-vs-hop-cycle aliasing caveat and the
 RF-core-stuck troubleshooting note.
 
 ```
-usage: rssi_scan.py [-h] -i IFACE [-d DEVTYPE] [--pages PAGES] [-c CHANNELS]
-                     [-t DWELL] [--poll-interval POLL_INTERVAL]
-                     [--threshold THRESHOLD] [-o OUTDIR]
+usage: rssi_scan.py [-h] -i IFACE [-d {cc1354p10,cc1352p7}] [-p PAGES]
+                    [-c CHANNELS] [-t DWELL] [--poll-interval POLL_INTERVAL]
+                    [--threshold THRESHOLD] [-o OUTDIR]
 
   -i IFACE          serial device (required)
   -d DEVTYPE        cc1354p10 (default) or cc1352p7
-  --pages           comma list of pages to scan (default: 0,28,31 - all of them)
+  -p, --pages       comma list of pages to scan, in the order given (default:
+                     28,31,0 - sub-1GHz first, 2.4GHz last deliberately; see
+                     the CC1352P7 band-switch caveat below)
   -c CHANNELS       restrict to these channels, clipped per page (default: full range)
   -t DWELL          seconds per channel (default: 0.5)
   --poll-interval   seconds between GET_RSSI polls within a channel (default: 0.05 -
@@ -604,35 +739,65 @@ usage: rssi_scan.py [-h] -i IFACE [-d DEVTYPE] [--pages PAGES] [-c CHANNELS]
 
 ```sh
 python3 tools/rssi_scan.py -i /dev/cu.usbmodemL45003IW1 -d cc1352p7
-python3 tools/rssi_scan.py -i /dev/cu.usbmodemLS4501DC1 --pages 28 -c 9-65 -t 3
+python3 tools/rssi_scan.py -i /dev/cu.usbmodemLS4501DC1 -p 28 -c 9-65 -t 3
+
+# If verifying a *hopping* jammer (jam24_hop.py/subg_jam_hop.py) on another
+# board, use a dwell longer than that jammer's own full hop cycle (channel
+# count * its dwell_ms) - too short a dwell samples on an unsynchronized
+# clock and can alias against the hop timing, missing real signal by chance:
+python3 tools/rssi_scan.py -i /dev/cu.usbmodemLS4501DC1 -p 28 -c 9-65 -t 3 --threshold 20
 ```
 
-### Sub-1GHz tools (CC1354P10)
+**CC1352P7 caveat:** switching *from* page 0 (2.4GHz) *into* a sub-1GHz
+page is confirmed higher-risk than the reverse - can leave `GET_RSSI`
+returning nothing at all and the next `SNIFFER_ON` failing outright. `-p`
+defaults to `28,31,0` specifically so the one unavoidable transition (if
+scanning both bands) goes sub-1GHz -> 2.4GHz rather than the riskier
+direction. See the script's own module docstring for the full writeup.
+Recovery: [`tools/kb_jtag_recover.sh`](#firmware-recovery-cc1352p7--cc1354p10).
 
-These target the CC1354P10's 902-928 MHz page-31 band (SUN O-QPSK Rate
-Mode 0, channels 0-128, `902.2 + 0.2*channel` MHz). See
+### Sub-1GHz tools (CC1354P10 + CC1352P7)
+
+Both boards support sub-1GHz page 31 (902-928 MHz US ISM, SUN O-QPSK Rate
+Mode 0, channels 0-128, `902.2 + 0.2*channel` MHz) and page 28 (863-876
+MHz EU/UK, channels 0-65, `863.0 + 0.2*channel` MHz). See
 [firmware/src/kb-cc1354p10/README.md](firmware/src/kb-cc1354p10/README.md)'s
-"Sub-1GHz support" section for the channel-plan history/caveats.
+"Sub-1GHz support" and "Page 28 support" sections for the channel-plan
+history/caveats - page 28 was ported verbatim to the CC1352P7 firmware
+(see [firmware/src/kb-cc1352p7/README.md](firmware/src/kb-cc1352p7/README.md)),
+so the same channel numbers/frequencies apply on either board.
 
 #### `subg_scan.py`
 
-Scans a channel list, writes a per-channel pcap for any channel that saw
-traffic, a text report, and a JSON results file. Also samples ambient RSSI
-per channel independent of packet capture.
+Scans a channel list on a given page, writes a per-channel pcap for any
+channel that saw traffic (quiet channels are left out, not written as
+empty header-only files), a text report, and a JSON results file. Also
+samples ambient RSSI per channel independent of packet capture.
 
 ```
 usage: subg_scan.py [-h] [-i IFACE] [-d DEVTYPE] [-t DWELL] [-c CHANNELS]
-                    [-o OUTDIR] [--rssi-interval RSSI_INTERVAL] [--no-rssi]
+                    [-p {28,31}] [-o OUTDIR] [--rssi-interval RSSI_INTERVAL]
+                    [--no-rssi]
 
-  -t DWELL         seconds per channel (default varies, check -h)
-  -c CHANNELS      channel spec (default: 0-9)
-  -o OUTDIR        output directory
-  --rssi-interval  seconds between ambient RSSI samples
-  --no-rssi        skip RSSI sampling entirely
+  -i IFACE, --iface IFACE           serial device (default: /dev/ttyACM0)
+  -d DEVTYPE, --devtype DEVTYPE     hardware type (default: cc1354p10)
+  -t DWELL, --dwell DWELL           seconds to listen per channel (default: 20)
+  -c CHANNELS, --channels CHANNELS  channel spec, e.g. '0-128' or '0,64,128'
+                                     (default: 0-9)
+  -p {28,31}, --page {28,31}        KillerBee page: 31 = 915 MHz US ISM,
+                                     channels 0-128 (default); 28 = 863-876
+                                     MHz EU/UK, channels 0-65
+  -o OUTDIR, --outdir OUTDIR        output directory (default: ./subg_scan_<timestamp>)
+  --rssi-interval RSSI_INTERVAL     seconds between ambient RSSI samples (default: 1.0)
+  --no-rssi                         disable ambient RSSI sampling (packet capture only)
 ```
 
 ```sh
-python3 tools/subg_scan.py -c 0-9 -t 10 -o ./subg_scan_results
+# Page 31 (915 MHz), default channels 0-9
+python3 tools/subg_scan.py -i /dev/cu.usbmodemLS4501DC1 -c 0-9 -t 10 -o ./subg_scan_results
+
+# Page 28 (863-876 MHz EU/UK), full channel range
+python3 tools/subg_scan.py -i /dev/cu.usbmodemL45003IW1 -d cc1352p7 -p 28 -c 0-65 -t 60
 ```
 
 #### `subg_track.py`
@@ -658,17 +823,84 @@ python3 tools/subg_track.py -c 0-9 --sweep-dwell 0.2 --max-runtime 120 -o ./trac
 
 #### `subg_jam.py`
 
-Rotating constant-carrier jam across sub-1GHz channels, keeping the jam
-active across every hop.
+Rotating constant-carrier jam (host-driven, `SET_CHANNEL` once per hop -
+see `subg_jam_hop.py` below for the on-chip version) across sub-1GHz
+channels on a single page, or across *both* pages in one run via
+`--page-channels`, keeping the jam continuously active across every hop.
+See [Firmware recovery](#firmware-recovery-cc1352p7--cc1354p10) if
+`jammer_on()` is ever rejected.
 
 ```
-usage: subg_jam.py [-h] [-i IFACE] [-d DEVTYPE] -c CHANNELS [--dwell DWELL]
+usage: subg_jam.py [-h] [-i IFACE] [-d DEVTYPE] [-c CHANNELS] [-p {28,31}]
+                   [--page-channels PAGE:CHANNELS] [--dwell DWELL]
                    [--cycles CYCLES] [--duration DURATION]
+
+  -i IFACE, --iface IFACE           serial device (default: /dev/ttyACM0)
+  -d DEVTYPE, --devtype DEVTYPE     hardware type (default: cc1354p10)
+  -c CHANNELS, --channels CHANNELS  channel spec, e.g. '9,14,15,19,20,24,106'
+                                     or '0-9'. Single-page mode, paired with
+                                     -p. Ignored if --page-channels is given.
+  -p {28,31}, --page {28,31}        KillerBee page: 31 = 915 MHz US ISM
+                                     (default); 28 = 863-876 MHz EU/UK.
+                                     Ignored if --page-channels is given.
+  --page-channels PAGE:CHANNELS     Jam across multiple pages in one
+                                     rotation: 'PAGE:CHANNELS', repeatable -
+                                     one per page. Overrides -c/-p entirely.
+  --dwell DWELL                     seconds per channel before hopping
+                                     (default: 0.03 = 30ms)
+  --cycles CYCLES                   stop after N full passes (default: 0 = unbounded)
+  --duration DURATION                stop after N seconds total (default: 0 = unbounded)
 ```
 
 ```sh
-python3 tools/subg_jam.py -c 9,14,15,19,20,24,106 --dwell 2
+python3 tools/subg_jam.py -i /dev/cu.usbmodemLS4501DC1 -c 9,14,15,19,20,24,106 --dwell 0.036
+python3 tools/subg_jam.py -c 9,14,15,19,20,24,106 --dwell 1 --cycles 5
 python3 tools/subg_jam.py -c 0-9 --dwell 1 --duration 60
+python3 tools/subg_jam.py -p 28 -c 0,13,26,39,52,65 --dwell 2   # 863-876 MHz EU/UK
+
+# Rotate across both pages in one run, in the order given, repeating that
+# order every cycle - --page-channels overrides -c/-p:
+python3 tools/subg_jam.py --dwell 0.036 \
+    --page-channels 31:9,14,15,19,20,24,106 \
+    --page-channels 28:10,12,20,41,51,57
+```
+
+#### `subg_jam_hop.py` (this fork, on-chip hop)
+
+Same jam as `subg_jam.py`, but the hop loop runs entirely on-chip
+(`KBCapabilities.PHYJAM_HOP`) instead of the host calling `SET_CHANNEL`
+once per hop - removes a measured, near-flat ~30ms per-hop USB/debug-probe
+control-plane tax that otherwise dominates `subg_jam.py`'s `--dwell` below
+~30ms regardless of the value chosen. Works against both the CC1354P10
+(default) and CC1352P7 (`-d cc1352p7`) - same channel plan, same command
+line either way. Always cross-page capable via repeatable
+`--page-channels`. See
+[firmware/src/kb-cc1354p10/README.md](firmware/src/kb-cc1354p10/README.md)'s
+"On-chip channel-hop jamming" section for the full measurement and
+hardware validation (including an independent RF-energy check). Trade-off:
+no live per-hop log, since the host isn't in the loop.
+
+```
+usage: subg_jam_hop.py [-h] [-i IFACE] [-d DEVTYPE] --page-channels
+                       PAGE:CHANNELS [--dwell DWELL] [--duration DURATION]
+
+  -i IFACE, --iface IFACE          serial device (default: /dev/ttyACM0)
+  -d DEVTYPE, --devtype DEVTYPE    cc1354p10 (default) or cc1352p7
+  --page-channels PAGE:CHANNELS    'PAGE:CHANNELS' (e.g. '31:9,14,15,19,20,24,106'),
+                                    repeatable - one per page (28 and/or 31)
+  --dwell DWELL                    seconds per channel before hopping
+                                    (default: 0.02 = 20ms, min 0.001)
+  --duration DURATION              stop after N seconds total (default: 0 =
+                                    unbounded, use Ctrl+C)
+```
+
+```sh
+python3 tools/subg_jam_hop.py -i /dev/cu.usbmodemLS4501DC1 --dwell 0.02 \
+    --page-channels 31:9,14,15,19,20,24,106 \
+    --page-channels 28:10,12,20,41,51,57
+
+python3 tools/subg_jam_hop.py -i /dev/cu.usbmodemL45003IW1 -d cc1352p7 --dwell 0.02 \
+    --page-channels 28:9-65
 ```
 
 ### Bootloader (RZUSBSTICK only)
@@ -933,20 +1165,28 @@ JTAG-level nudge through the same debug probe you'd use to flash it -
 **no physical unplug needed** for this class of fault:
 
 ```sh
-# CC1352P7
-/opt/ti/uniflash_sl/dslite.sh --mode memory \
-    -c firmware/src/kb-cc1352p7/CC1352P7_XDS110.ccxml -r 0x0,4 -o /tmp/discard.bin -e
+tools/kb_jtag_recover.sh cc1352p7
+tools/kb_jtag_recover.sh cc1354p10
 
-# CC1354P10
-/opt/ti/uniflash_sl/dslite.sh --mode memory \
-    -c firmware/src/kb-cc1354p10/CC1354P10_XDS110.ccxml -r 0x0,4 -o /tmp/discard.bin -e
+# If dslite.sh lives somewhere other than the /opt/ti/uniflash_sl default
+# this project's docs assume (e.g. macOS's /Applications/ti/uniflash_<ver>/):
+DSLITE=/Applications/ti/uniflash_9.6.0/dslite.sh tools/kb_jtag_recover.sh cc1352p7
 ```
 
-This is a side-effect-free memory read whose only real purpose is forcing
+`tools/kb_jtag_recover.sh` wraps the underlying DSLite command so you don't
+have to hand-build it or manage its output file yourself:
+
+```sh
+dslite.sh --mode memory -c <board's .ccxml> -r 0x0,4 -o <tmpfile> -e
+```
+
+a side-effect-free 4-byte memory read whose only real purpose is forcing
 DSLite to connect and run its GEL board-reset script - any DSLite operation
 that connects works, this one's just minimal. Note the `--mode memory` flag
 specifically: `dslite.sh` selects its mode via `--mode <name>`, not a bare
-positional argument.
+positional argument. The read's own output is never used, so the script
+writes it to a private temp directory it cleans up on exit rather than a
+fixed, shared path.
 
 If instead **the debug probe itself** stops responding (`DSLite`/`xds110reset`
 failing with `Error -261`/`Error -260` even for an unrelated no-op like

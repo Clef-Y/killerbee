@@ -44,6 +44,7 @@ Usage:
     python3 tools/subg_jam_hop.py -i /dev/cu.usbmodemLS4501DC1 --dwell 0.02 \\
         --page-channels 31:9,14,15,19,20,24,106 \\
         --page-channels 28:10,12,20,41,51,57
+python3 tools/subg_jam_hop.py -i /dev/cu.usbmodemL45003IW1 -d cc1352p7 --dwell 0.02 --page-channels 28:9-65
 
 Ctrl+C stops cleanly (JAMMER_OFF, then closes the device) at any point.
 """

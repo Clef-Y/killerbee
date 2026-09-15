@@ -121,9 +121,9 @@ def main() -> None:
                           "The full hop sequence is every given page's channels in "
                           "the order the flags appear, repeating that same order "
                           "each cycle. Overrides -c/-p entirely when given.")
-    ap.add_argument("--dwell", type=float, default=2.0,
+    ap.add_argument("--dwell", type=float, default=0.03,
                      help="Seconds to jam each channel before hopping to the next "
-                          "(default: 2.0)")
+                          "(default: 0.03 = 30ms)")
     ap.add_argument("--cycles", type=int, default=0,
                      help="Stop after this many full passes through the channel "
                           "list (default: 0 = run until Ctrl+C or --duration)")
@@ -205,9 +205,9 @@ def main() -> None:
             idx = (idx + 1) % len(hops)
             if idx == 0:
                 cycle += 1
-                if args.cycles and cycle >= args.cycles:
+                if args.cycles > 0 and cycle >= args.cycles:
                     break
-            if args.duration and (time.time() - run_start) >= args.duration:
+            if args.duration > 0 and (time.time() - run_start) >= args.duration:
                 break
 
             page, ch = hops[idx]
