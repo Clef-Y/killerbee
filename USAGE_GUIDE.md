@@ -419,6 +419,15 @@ for the full measurement and hardware validation (including an independent
 RF-energy check confirming genuine on-air hopping, not just command-level
 success). Trade-off: no live per-hop log, since the host isn't in the loop.
 
+**Minimum reliable `--dwell` (measured):** 3ms is the shortest dwell that
+hops cleanly and strongly on every channel, confirmed with an independent
+RSSI monitor on a second board; 2ms still works with less margin. 1ms -
+the wire protocol's own floor - is marginal (at least one channel
+measurably weaker or missing in every trial) since it's the same order of
+magnitude as `rfTuneToChannel()`'s own ~1ms-worst-case retune cost. See
+firmware/src/kb-cc1352p7/README.md's "On-chip channel-hop jamming"
+section for the full measurement.
+
 ```
 usage: jam24_hop.py [-h] [-i IFACE] [-d DEVTYPE] -c CHANNELS
                      [--dwell DWELL] [--duration DURATION]
@@ -428,13 +437,15 @@ usage: jam24_hop.py [-h] [-i IFACE] [-d DEVTYPE] -c CHANNELS
                  currently implements this)
   -c CHANNELS    channel spec, e.g. '11,12,13,14,15,20,22,26' or '11-26' (required)
   --dwell        seconds per channel before hopping (default: 0.02 = 20ms;
-                 converted to whole milliseconds for the firmware)
+                 converted to whole milliseconds for the firmware; 0.003 =
+                 3ms is the measured reliable floor, see above)
   --duration     stop after N seconds total (default: 0 = unbounded, Ctrl+C)
 ```
 
 ```sh
 python3 tools/jam24_hop.py -i /dev/cu.usbmodemL45003IW1 -c 11,12,13,14,15,20,22,26 --dwell 0.02
 python3 tools/jam24_hop.py -c 11,15,20,25 --dwell 0.05 --duration 30
+python3 tools/jam24_hop.py -c 11,15,20,25 --dwell 0.003 --duration 30   # measured reliable floor
 ```
 
 #### `subg_jam.py` / `subg_jam_hop.py` (this fork, CC1354P10 + CC1352P7, sub-1GHz)
@@ -880,6 +891,13 @@ line either way. Always cross-page capable via repeatable
 hardware validation (including an independent RF-energy check). Trade-off:
 no live per-hop log, since the host isn't in the loop.
 
+**Minimum reliable `--dwell` (measured, page 31):** same floor as
+`jam24_hop.py`'s 2.4GHz result above - 3ms hops cleanly and strongly on
+every channel; 1ms (the wire protocol's own floor) is marginal, dropping
+at least one channel to noise-floor level in testing. See
+firmware/src/kb-cc1354p10/README.md's "On-chip channel-hop jamming"
+section for the measurement.
+
 ```
 usage: subg_jam_hop.py [-h] [-i IFACE] [-d DEVTYPE] --page-channels
                        PAGE:CHANNELS [--dwell DWELL] [--duration DURATION]
@@ -889,7 +907,8 @@ usage: subg_jam_hop.py [-h] [-i IFACE] [-d DEVTYPE] --page-channels
   --page-channels PAGE:CHANNELS    'PAGE:CHANNELS' (e.g. '31:9,14,15,19,20,24,106'),
                                     repeatable - one per page (28 and/or 31)
   --dwell DWELL                    seconds per channel before hopping
-                                    (default: 0.02 = 20ms, min 0.001)
+                                    (default: 0.02 = 20ms, min 0.001; 0.003 =
+                                    3ms is the measured reliable floor, see above)
   --duration DURATION              stop after N seconds total (default: 0 =
                                     unbounded, use Ctrl+C)
 ```
@@ -901,6 +920,9 @@ python3 tools/subg_jam_hop.py -i /dev/cu.usbmodemLS4501DC1 --dwell 0.02 \
 
 python3 tools/subg_jam_hop.py -i /dev/cu.usbmodemL45003IW1 -d cc1352p7 --dwell 0.02 \
     --page-channels 28:9-65
+
+python3 tools/subg_jam_hop.py -i /dev/cu.usbmodemLS4501DC1 --dwell 0.003 \
+    --page-channels 31:9,40,80,120   # measured reliable floor
 ```
 
 ### Bootloader (RZUSBSTICK only)

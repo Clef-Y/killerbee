@@ -40,6 +40,18 @@ Trade-off: because the host isn't in the loop, this tool can't print a
 live per-hop channel/frequency log the way tools/subg_jam.py does - it
 just starts the hop, waits (Ctrl+C or --duration), then stops it.
 
+Minimum reliable --dwell (measured, page 31, CC1354P10, cross-validated
+with a CC1352P7 running rssi_scan.py as an independent monitor - same
+method and same result as jam24_hop.py's 2.4GHz floor-finding, see that
+script's docstring): 3ms is clean and strong on every channel (~-71 to
+-72 dBm, 33-34 dB above baseline). 1ms - the wire protocol's own floor
+(dwell_ms is a uint16 ms value and 0 is rejected) - is marginal: one of
+four channels came back indistinguishable from noise while the others
+still showed real spikes, the same inconsistent-per-hop pattern as
+2.4GHz, for the same reason (rfTuneToChannel()'s ~1ms-worst-case retune
+cost becomes the same order of magnitude as the requested dwell). Treat
+3ms as the shortest --dwell to rely on; below that is not recommended.
+
 Usage:
     python3 tools/subg_jam_hop.py -i /dev/cu.usbmodemLS4501DC1 --dwell 0.02 \\
         --page-channels 31:9,14,15,19,20,24,106 \\

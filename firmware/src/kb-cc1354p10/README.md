@@ -696,6 +696,20 @@ both endpoints) against a much quieter baseline on channels outside the
 jammed range - see `../kb-cc1352p7/README.md`'s own "On-chip channel-hop
 jamming" section for the full writeup.
 
+**Minimum reliable `--dwell` (measured):** same floor-finding exercise as
+the CC1352P7 firmware's 2.4GHz hop (see that README's "On-chip
+channel-hop jamming" section for the full measurement and reasoning),
+applied here on page 31, cross-validated with the CC1352P7 as an
+independent `rssi_scan.py` monitor (channels 9, 40, 80, 120). 3ms dwell:
+clean and strong on every channel (~-71 to -72 dBm, 33-34 dB above
+baseline). 1ms - the wire protocol's own floor - is marginal: one of four
+channels came back indistinguishable from noise (-107 dBm) while the
+others still showed real spikes, the same inconsistent-per-hop pattern
+seen on 2.4GHz and for the same reason (`rfTuneToChannel()`'s
+~1ms-worst-case retune cost becomes the same order of magnitude as the
+requested dwell). **Treat 3ms as the shortest `--dwell` to rely on here
+too; below that is not recommended.**
+
 ## Wire protocol
 
 921600 baud, 8N1, no flow control, no CRC (short USB-serial link, matches the

@@ -32,6 +32,22 @@ ran): every listed channel showed a strong RSSI spike (~-59 to -70 dBm)
 against a ~-106 to -112 dBm noise floor, confirming genuine on-air hopping
 across exactly the given channels, not just command-level success.
 
+Minimum reliable --dwell (measured): pushed down from 20ms to find the
+actual floor, same independent-RSSI-monitor method as above. 3ms is clean
+and strong on every channel across repeated trials (~-57 to -68 dBm,
+32-43 dB above baseline); 2ms still works but with less margin (~-74 to
+-82 dBm). 1ms - the wire protocol's own floor (dwell_ms is a uint16 ms
+value and 0 is rejected) - is marginal: at least one of four channels came
+back measurably weaker or fully indistinguishable from noise in every 1ms
+trial, consistent with rfTuneToChannel()'s own ~1ms-worst-case retune cost
+being the same order of magnitude as the requested dwell at that point, so
+actual per-channel on-air time gets inconsistent hop to hop. No hang/wedge
+at any of these dwells during the hop itself, though heavy back-to-back
+low-dwell runs did eventually trigger the documented "RF core can get
+stuck after heavy use" state once - recovered cleanly via
+tools/kb_jtag_recover.sh. Treat 3ms as the shortest --dwell to rely on;
+2ms works with reduced margin; below that is not recommended.
+
 Usage:
     python3 tools/jam24_hop.py -i /dev/cu.usbmodemL45003IW1 -c 11,12,13,14,15,20,22,26 --dwell 0.02
     python3 tools/jam24_hop.py -c 11,25 --dwell 0.1
