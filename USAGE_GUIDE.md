@@ -224,6 +224,30 @@ python3 tools/rssi_scan.py -i /dev/cu.usbmodemLS4501DC1 -d cc1354p10
 tools/kb_jtag_recover.sh cc1354p10
 ```
 
+### Both boards together (dual-band hop jam)
+
+`tools/jam_dualband_hop.py` drives both boards *at once* - 2.4GHz hop on
+the CC1352P7, sub-1GHz hop on the CC1354P10, running concurrently under
+one command instead of two terminals. Wraps `jam24_hop.py`'s and
+`subg_jam_hop.py`'s own channel-parsing logic unchanged; see
+[its section below](#jam_dualband_hoppy-this-fork-both-boards-at-once)
+for full flag docs.
+
+```sh
+python3 tools/jam_dualband_hop.py \
+    --iface24 /dev/cu.usbmodemL45003IW1 --iface-subg /dev/cu.usbmodemLS4501DC1 \
+    -c 11,15,20,25 --page-channels 31:9,40,80,120 --dwell 0.003
+```
+
+Hardware-validated at the measured 3ms dwell floor: with both hops
+running simultaneously, briefly pausing each board's own jam in turn to
+reuse it as an independent RSSI monitor for the *other* (never the one
+being measured) showed strong, clean signal on every channel of both
+bands - 2.4GHz peaked -58 to -59 dBm (39-40 dB above baseline) while
+sub-1GHz was actively hopping, and sub-1GHz peaked -55 to -57 dBm (49-51
+dB above baseline) while 2.4GHz was actively hopping. Both boards stayed
+responsive throughout and after.
+
 **Cross-board validation tip:** both boards implement the identical page
 28/31 channel plans, so one board's `rssi_scan.py` (or `subg_scan.py`)
 makes an independent RF monitor for a jammer running on the *other*
@@ -456,6 +480,55 @@ Same host-driven-rotation vs. on-chip-hop split as `jam24_rotate.py` vs.
 against *either* board (`-d cc1352p7` or the default `cc1354p10`), and
 both can hop across both pages in a single run. Full flag docs and
 examples: [Sub-1GHz tools](#sub-1ghz-tools-cc1354p10--cc1352p7) below.
+
+#### `jam_dualband_hop.py` (this fork, both boards at once)
+
+Runs `jam24_hop.py` and `subg_jam_hop.py` *simultaneously* on two separate
+physical boards under one command: 2.4GHz on-chip hop on a CC1352P7
+(`--iface24`), sub-1GHz on-chip hop on a second board (`--iface-subg`,
+CC1354P10 by default, or a second CC1352P7). Each board's hop is fully
+on-chip and independent once started - this tool just starts both back to
+back, waits, and stops both together. Needs two physical boards; a single
+board has one radio and can't run both bands at once. See
+[Both boards together](#both-boards-together-dual-band-hop-jam) above for
+the hardware-validated RF evidence at the measured 3ms dwell floor.
+
+```
+usage: jam_dualband_hop.py [-h] --iface24 IFACE24 [--devtype24 DEVTYPE24]
+                           --iface-subg IFACE_SUBG
+                           [--devtype-subg DEVTYPE_SUBG] -c CHANNELS
+                           --page-channels PAGE:CHANNELS [--dwell DWELL]
+                           [--dwell24 DWELL24] [--dwell-subg DWELL_SUBG]
+                           [--duration DURATION]
+
+  --iface24 IFACE24        serial device for the 2.4GHz board (must be CC1352P7)
+  --devtype24               hardware type for the 2.4GHz board (default: cc1352p7)
+  --iface-subg IFACE_SUBG  serial device for the sub-1GHz board (a second,
+                            physically different board from --iface24)
+  --devtype-subg            hardware type for the sub-1GHz board (default: cc1354p10)
+  -c CHANNELS               2.4GHz channel spec, e.g. '11,15,20,25' or '11-26'
+  --page-channels PAGE:CHANNELS   sub-1GHz 'PAGE:CHANNELS', repeatable - one per page
+  --dwell DWELL             seconds per channel for BOTH bands (or set
+                             --dwell24/--dwell-subg separately; one of these
+                             combinations is required, no default)
+  --dwell24 / --dwell-subg  per-band override of --dwell
+  --duration DURATION       stop both after N seconds total (default: 0 =
+                             unbounded, use Ctrl+C)
+```
+
+```sh
+python3 tools/jam_dualband_hop.py \
+    --iface24 /dev/cu.usbmodemL45003IW1 \
+    --iface-subg /dev/cu.usbmodemLS4501DC1 \
+    -c 11,15,20,25 --page-channels 31:9,40,80,120 --dwell 0.003
+
+# Different dwell per band, bounded run, both sub-1GHz pages at once:
+python3 tools/jam_dualband_hop.py \
+    --iface24 /dev/cu.usbmodemL45003IW1 --iface-subg /dev/cu.usbmodemLS4501DC1 \
+    -c 11,25 --dwell24 0.02 \
+    --page-channels 31:9,14,15,19,20,24,106 --page-channels 28:10,12,20,41,51,57 \
+    --dwell-subg 0.003 --duration 30
+```
 
 ### Attack / flood tools
 
