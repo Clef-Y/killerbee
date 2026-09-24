@@ -153,7 +153,15 @@ want to build this project's custom firmware from source, or recover a
 board that's gotten into a stuck RF-core state (see
 [USAGE_GUIDE.md's Firmware recovery section](USAGE_GUIDE.md#firmware-recovery-cc1352p7--cc1354p10)),
 you need TI's SimpleLink toolchain instead - a much larger, separate
-install:
+install.
+
+> **Full step-by-step is in [TI_SDK_SETUP_MACOS.md](TI_SDK_SETUP_MACOS.md)**
+> - confirmed tool versions, macOS install paths, the Rosetta 2
+> requirement for DSLite on Apple Silicon, `imports.mak`/env-var
+> configuration, and the build/flash/recover commands. The summary below is
+> just the shape of it.
+
+The pieces:
 
 - **TI UniFlash** (standalone) - provides `dslite.sh` and the `DSLite`
   debug-server binary this project's firmware recovery/flash commands use.

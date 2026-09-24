@@ -237,3 +237,10 @@ The current version, fixes, etc are handled by: killerbee@riverloopsecurity.com.
 (See the list above for all contributors/credits.)
 
 For contributors/developers, see [`DEVELOPMENT.md`](DEVELOPMENT.md) for details and guidance.
+
+This fork adds custom TI CC1354P10 / CC1352P7 firmware. To just *use* an
+already-flashed board, see [`USAGE_GUIDE.md`](USAGE_GUIDE.md) (host setup +
+every CLI tool) and [`MACOS_SETUP.md`](MACOS_SETUP.md) (macOS host setup).
+To *build or flash* the firmware, see the TI SDK / dev-environment guides:
+[`TI_SDK_SETUP_DEBIAN.md`](TI_SDK_SETUP_DEBIAN.md) and
+[`TI_SDK_SETUP_MACOS.md`](TI_SDK_SETUP_MACOS.md).
