@@ -59,6 +59,10 @@ const customStack = scripting.addModule("/ti/devices/radioconfig/custom");
 const phyInst = commonRf.addIeeePhy(customStack, default154Phy);
 phyInst.$name = "RF_Settings_IEEE_802_15_4";
 phyInst.codeExportConfig.useMulti = false;
+// TX power raised 0 -> +5 dBm (authorized TX-power-promotion test). +5 dBm
+// is this board's 2.4 GHz default-PA table ceiling (txPowerTable_2400_pa5);
+// the +20 dBm high-PA is routed to sub-1GHz on the LP_EM_CC1354P10_1.
+phyInst.txPower = "5";
 
 /* ======== Radio Configuration: 915 MHz SUN O-QPSK (sub-1GHz) PHY ========
  * Modern IEEE 802.15.4g "SUN" O-QPSK equivalent of the classic 915 MHz
@@ -72,26 +76,31 @@ phyInst.codeExportConfig.useMulti = false;
  * main.c (see its rfSwitchBand() comment for the tradeoffs of that
  * approach on this hardware).
  *
- * txPower explicitly set to a conservative 0 dBm (default is 14, capped to
- * this table's max of 12) and highPA left at its default false (the
- * +20 dBm high-PA table is never used here). This is a real mitigation,
- * not a guess: a hardware-confirmed brown-out reset (AON_PMCTL.RESETCTL
- * RESET_SRC=VDDS_LOSS, read directly off the chip during a reproduced
- * hang - see README's "Sub-1GHz support" section) was found to correlate
- * with sub-1GHz TX key-up, most likely from the PA's current step
- * exceeding what this board's power delivery (LP_EM_CC1354P10_1 through
- * the LP-XDS110's jumper/ribbon power path) can sustain without the
- * supply rail dipping below the brown-out threshold - even at the
- * already-modest default 12-14 dBm this PHY preset was using. Lowering
- * further reduces that current step. This does not fix the underlying
- * power-delivery issue (a clean bench supply is the real fix) and has not
- * yet been empirically confirmed to eliminate the brown-out - it's a
- * reasonable firmware-side mitigation, not a proven cure. */
+ * txPower raised 0 -> +12 dBm (DEFAULT-PA table max) for the authorized
+ * TX-power-promotion bench test. Why not +20 dBm like the CC1352P7: on this
+ * CC13x4, the +20 dBm high-PA entry's value is 0xFFFF (a "set at runtime via
+ * RF_setTxPower" sentinel) and this qpsk PHY emits NO high-PA register
+ * override table to resolve it (verified: pRegOverrideTx20 stays 0 even with
+ * paExport=dual). main.c never calls RF_setTxPower, so a high-PA build makes
+ * the RF core reject every sub-1GHz TX command (observed: "Device rejected
+ * jammer_on()"). Reaching +20 dBm here needs a firmware change (an explicit
+ * RF_setTxPower after each sub-1GHz RF_open), not just this syscfg - and on
+ * this board it would likely brown out anyway (below).
+ *
+ * BROWN-OUT RISK (real, hardware-confirmed on THIS board): the 0 dBm default
+ * was a mitigation for a VDDS_LOSS reset (AON_PMCTL.RESETCTL, read off-chip
+ * during a reproduced hang - see README) on sub-1GHz TX key-up, from the PA
+ * current step exceeding what the LP_EM_CC1354P10_1 / LP-XDS110 jumper-ribbon
+ * power path can sustain - it browned out even at the default 12-14 dBm. So
+ * +12 dBm is at the edge: it is set deliberately and the two-board RSSI
+ * measurement + post-burst PING health check will catch a brown-out (board
+ * unresponsive -> JTAG-nudge recovery). If it browns out, step down (+10,
+ * +8...). A clean bench supply is the real fix. Empirical result in README. */
 const subgPhy = {
     args: {
         freqBand: "868",
         phyType868: "qpsk6kbpsrm0",
-        txPower: "0"
+        txPower: "12"      // default-PA table max (see comment above re: +20)
     }
 };
 const subgPhyInst = commonRf.addPropPhy(customStack, subgPhy, false);

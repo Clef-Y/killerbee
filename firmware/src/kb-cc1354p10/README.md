@@ -926,3 +926,53 @@ CC1354P10 and CC1352P7, with no timing regression (~30-40ms/call
 throughout, no growth). This looks like a full fix rather than a bigger
 but still-finite budget - worth staying skeptical of until it's seen more
 runtime, but nothing in this session's testing contradicts that.
+
+## TX power: raised to the board's reachable maximum (+ measured sweep)
+
+The PHY `txPower` in `kb_cc1354p10.syscfg` was raised from the historical
+conservative 0 dBm (a brown-out mitigation) to each band's **reachable**
+maximum on this board:
+
+| Band | PA path | `txPower` | Notes |
+|---|---|---|---|
+| 2.4 GHz (page 0) | IEEE 802.15.4, default PA | **+5 dBm** | `txPowerTable_2400_pa5` ceiling. |
+| sub-1 G 915 (page 31) | SUN O-QPSK, **default PA** | **+12 dBm** | default-PA table max. |
+| sub-1 G 868 (page 28) | same PHY, retuned | **+12 dBm** | same table. |
+
+### Why not +20 dBm high-PA (as on the CC1352P7)
+
+On this **CC13x4**, the sub-1GHz PHY's compile-time `txPower` field is a
+runtime sentinel (`0xFFFE` default-PA / `0xFFFF` high-PA), and the
+`qpsk6kbpsrm0` PHY emits **no high-PA register override table** (`pRegOverrideTx20`
+stays `0` even with `paExport = "dual"`). `main.c` never calls `RF_setTxPower`,
+so a high-PA (+20 dBm) build makes the RF core **reject every sub-1GHz TX
+command** ("Device rejected jammer_on()"). Reaching +20 dBm here needs a
+firmware change — an explicit `RF_setTxPower()` after each sub-1GHz `RF_open()`
+(and re-applied on every `rfSwitchBand()`), not just a syscfg edit. The
+CC1352P7's 2-GFSK PHY, by contrast, *did* emit the Tx20 override, so there a
+syscfg-only +20 dBm worked. (The default-PA sentinel `0xFFFE` *is* applied by
+the driver from the registered table at `RF_open` — confirmed: changing
+`txPower` 0 -> 12 raised the measured carrier, see below.)
+
+### Verification: two-board RSSI sweep (CC1354P10 jam -> CC1352P7 listen)
+
+| Band (ch) | 0 dBm | raised |
+|---|---|---|
+| page 31, ch 5 (903.2 MHz) | −65 dBm | −59 dBm (+12 dBm) |
+| page 28, ch 5 (864.0 MHz) | −60 dBm | −49 dBm (+12 dBm) |
+| 2.4 GHz, ch 15 (2425 MHz) | −74 dBm | −67 dBm (+5 dBm) |
+
+### Brown-out: did NOT recur at +12 dBm
+
+This board is the one where the **VDDS_LOSS brown-out** was hardware-confirmed
+(it reset even at the old 12-14 dBm default, through the weak LP-XDS110
+jumper/ribbon power path). At +12 dBm default-PA it was **stable**: **15/15
+clean key-up cycles** across both pages / multiple channels / 2.4 GHz, 1 s
+sustained carrier each, 0 resets, PING OK throughout. The measured rise
+(+6 to +11 dB for the +12 dBm change) runs a little under the label, i.e. the
+effective PA current is likely below a textbook +12 dBm default-PA draw -
+consistent with it clearing the brown-out that bit the old preset.
+
+**Caveat:** validated for short jam bursts only; sustained +12 dBm TX over
+minutes is not characterized, and a clean bench supply (not USB/ribbon) is the
+real fix for pushing higher. Transmit only where legally authorized.
