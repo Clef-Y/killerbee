@@ -941,18 +941,32 @@ maximum on this board:
 
 ### Why not +20 dBm high-PA (as on the CC1352P7)
 
+**+20 dBm high-PA was attempted and empirically does not work on this
+board/PHY** — the reachable max is the +12 dBm **default PA**.
+
 On this **CC13x4**, the sub-1GHz PHY's compile-time `txPower` field is a
 runtime sentinel (`0xFFFE` default-PA / `0xFFFF` high-PA), and the
 `qpsk6kbpsrm0` PHY emits **no high-PA register override table** (`pRegOverrideTx20`
-stays `0` even with `paExport = "dual"`). `main.c` never calls `RF_setTxPower`,
-so a high-PA (+20 dBm) build makes the RF core **reject every sub-1GHz TX
-command** ("Device rejected jammer_on()"). Reaching +20 dBm here needs a
-firmware change — an explicit `RF_setTxPower()` after each sub-1GHz `RF_open()`
-(and re-applied on every `rfSwitchBand()`), not just a syscfg edit. The
-CC1352P7's 2-GFSK PHY, by contrast, *did* emit the Tx20 override, so there a
-syscfg-only +20 dBm worked. (The default-PA sentinel `0xFFFE` *is* applied by
-the driver from the registered table at `RF_open` — confirmed: changing
-`txPower` 0 -> 12 raised the measured carrier, see below.)
+stays `0` even with `paExport = "dual"`). A plain high-PA build therefore makes
+the RF core **reject every sub-1GHz TX command** ("Device rejected
+jammer_on()").
+
+The obvious fix — a runtime `RF_setTxPower(rfHandle,
+RF_TxPowerTable_findValue(txPowerTable_868_pa20, RF_TxPowerTable_MAX_DBM))`
+after each sub-1GHz `RF_open()` in `rfSwitchBand()` — **was implemented and
+tested, and the sub-1GHz jam was still rejected.** `RF_setTxPower` is
+*necessary but not sufficient*: it supplies the PA table *value*, but the
+high-PA hardware also needs the register override this PHY never generates,
+and the driver can't synthesize it. So +20 dBm high-PA is **not reachable with
+the `qpsk6kbpsrm0` (TI "Release Candidate") sub-1GHz PHY on this CC13x4** —
+it would take either a 2-GFSK PHY that emits the override (as the CC1352P7
+uses) or a hand-built high-PA override, neither of which is worth the
+sniff/channel-plan churn here. (The CC1352P7's 2-GFSK PHY *did* emit the Tx20
+override, which is why its syscfg-only +20 dBm worked.)
+
+The **default-PA** path works cleanly: the `0xFFFE` sentinel *is* applied by
+the driver from the registered table at `RF_open` — confirmed, changing
+`txPower` 0 -> 12 raised the measured carrier (below).
 
 ### Verification: two-board RSSI sweep (CC1354P10 jam -> CC1352P7 listen)
 
