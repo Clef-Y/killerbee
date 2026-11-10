@@ -530,6 +530,54 @@ python3 tools/jam_dualband_hop.py \
     --dwell-subg 0.003 --duration 30
 ```
 
+#### `jam_bandswitch_hop.py` (this fork, one board, both bands over time)
+
+Covers both bands with a **single** CC1352P7 by time-slicing: it runs the
+2.4GHz on-chip hop for `--band-duration` seconds, stops it, switches the
+radio to sub-1GHz and runs the page 28/31 on-chip hop for `--band-duration`
+seconds, then switches back - repeating until Ctrl+C, `--cycles`, or
+`--duration`. Unlike [`jam_dualband_hop.py`](#jam_dualband_hoppy-this-fork-both-boards-at-once)
+(two boards, both bands *at once*), this is one board covering each band in
+turn, freeing a second board to run `rssi_scan.py` as an independent
+monitor. Requires a CC1352P7 - the only firmware with an on-chip hop mode on
+both page 0 and page 28/31.
+
+> **Band-switch caveat.** Each switch calls the firmware's `rfSwitchBand()`
+> (`RF_close()`+`RF_open()`), the same blocking wait documented elsewhere in
+> this fork as an intermittent hang risk. The tool health-checks the board
+> (a `CMD_PING` via `get_dev_info()`) after every switch and stops cleanly -
+> printing the JTAG recovery command - if the board goes unresponsive rather
+> than running blind. Keep `--band-duration` a real number of seconds (not
+> sub-second) to keep the switch-attempt rate sane.
+
+```
+usage: jam_bandswitch_hop.py [-h] [-i IFACE] [-d DEVTYPE] -c CHANNELS
+                             --page-channels PAGE:CHANNELS [--dwell DWELL]
+                             [--band-duration BAND_DURATION] [--cycles CYCLES]
+                             [--duration DURATION]
+
+  -i IFACE                  serial device (must be a CC1352P7; default /dev/ttyACM0)
+  -d DEVTYPE                hardware type (default: cc1352p7)
+  -c CHANNELS               2.4GHz channel spec, e.g. '11,15,20,25' or '11-26'
+  --page-channels PAGE:CHANNELS   sub-1GHz 'PAGE:CHANNELS', repeatable - one per page
+  --dwell DWELL             seconds per channel within each band's on-chip hop
+                             (default: 0.003 = the 3ms measured reliable floor)
+  --band-duration           seconds to run each band before switching (default: 3.0)
+  --cycles CYCLES           stop after N full 2.4GHz+sub-1GHz cycles (default: 0 = unbounded)
+  --duration DURATION       stop after N seconds total (default: 0 = unbounded)
+```
+
+```sh
+# 3s on 2.4GHz, 3s on sub-1GHz page 28, repeat for 30s total:
+python3 tools/jam_bandswitch_hop.py -i /dev/cu.usbmodemL45003IW1 \
+    -c 11,15,20,25 --page-channels 28:9,20,40,65 \
+    --dwell 0.003 --band-duration 3 --duration 30
+
+# Unbounded, Ctrl+C to stop (stops whichever band is active):
+python3 tools/jam_bandswitch_hop.py -i /dev/cu.usbmodemL45003IW1 \
+    -c 11,25 --page-channels 28:9-65 --dwell 0.003 --band-duration 5
+```
+
 ### Attack / flood tools
 
 These target a specific, already-identified network (PAN ID, coordinator
