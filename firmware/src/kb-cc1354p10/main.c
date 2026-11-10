@@ -963,12 +963,13 @@ static void *jamHopThread(void *arg0)
 
 /* Starts (or resumes, e.g. after KB_CMD_SET_CHANNEL stopped and is now
  * restarting it - see startJammer()) hop jamming using whatever is
- * currently in hopRanges/hopRangeCount/hopDwellUs. Always forces
- * BAND_SUBG first since hop pages are always sub-1GHz (28/31) -
+ * currently in hopRanges/hopRangeCount/hopDwellUs. Forces the correct band
+ * first, chosen from the (single-band, validated in KB_CMD_JAM_HOP_ON) hop
+ * list: page 0 -> BAND_24GHZ (2.4GHz hop), pages 28/31 -> BAND_SUBG.
  * rfSwitchBand() is a no-op if already on that band. */
 static bool startJamHop(void)
 {
-    rfSwitchBand(BAND_SUBG);
+    rfSwitchBand(hopRanges[0].page == 0 ? BAND_24GHZ : BAND_SUBG);
     hopRunning = true;
     pthread_attr_t attrs;
     pthread_attr_init(&attrs);
@@ -1264,10 +1265,14 @@ static void handleCommand(uint8_t cmd, const uint8_t *payload, uint8_t len)
 
     case KB_CMD_JAM_HOP_ON: {
         /* payload = [dwell_ms lo][dwell_ms hi][rangeCount][page0][chStart0]
-         * [chEnd0]...[page(n-1)][chStart(n-1)][chEnd(n-1)]. Sub-1GHz only -
-         * each range must be (31, 0<=start<=end<=128) or (28, 0<=start<=
-         * end<=65) - see this file's header comment ("stage 6") and
-         * jamHopThread() for why ranges rather than an explicit per-channel
+         * [chEnd0]...[page(n-1)][chStart(n-1)][chEnd(n-1)]. Single-band -
+         * every range must be the same band: page 0 = 2.4GHz (11<=start<=
+         * end<=26), or sub-1GHz page 31 (0<=start<=end<=128) / page 28
+         * (0<=start<=end<=65). 2.4GHz hop (page 0) lets jam24_hop.py drive
+         * this board too, not just the CC1352P7 - the hop thread and band
+         * selection (startJamHop) handle either band; only mixing bands in
+         * one list is disallowed. See this file's header comment ("stage 6")
+         * and jamHopThread() for why ranges rather than an explicit per-channel
          * list (payload size), and why each range needs its own page
          * rather than a bare channel span (page 31/28 use different
          * rfTuneToChannel() frequency formulas at the same raw channel
@@ -1284,12 +1289,24 @@ static void handleCommand(uint8_t cmd, const uint8_t *payload, uint8_t len)
                           || len != (uint8_t)(3 + 3 * rangeCount));
         }
         if (!badPayload) {
+            /* The band is chosen once from the first range (startJamHop) and
+             * the hop thread never switches bands mid-rotation, so every
+             * range must be the SAME band: page 0 = 2.4GHz (channels 11-26),
+             * pages 28/31 = sub-1GHz. Mixing the two in one hop list is
+             * rejected (a cross-band hop would need a per-hop RF_close/RF_open
+             * band switch - the documented hang/brown-out risk - which this
+             * on-chip loop deliberately avoids). */
+            bool firstIsSubg = (payload[3] != 0);
             for (uint8_t i = 0; i < rangeCount; i++) {
                 uint8_t p = payload[3 + 3 * i];
                 uint8_t chStart = payload[3 + 3 * i + 1];
                 uint8_t chEnd = payload[3 + 3 * i + 2];
-                uint8_t maxCh = (p == 31) ? 128 : (p == 28) ? 65 : 0xFF;
-                bool okRange = (p == 31 || p == 28) && chStart <= chEnd && chEnd <= maxCh;
+                uint8_t minCh = (p == 0) ? 11 : 0;  /* 2.4GHz IEEE chans start at 11 */
+                uint8_t maxCh = (p == 31) ? 128 : (p == 28) ? 65 : (p == 0) ? 26 : 0xFF;
+                bool okPage = (p == 31 || p == 28 || p == 0);
+                bool sameBand = ((p != 0) == firstIsSubg);
+                bool okRange = okPage && sameBand && chStart >= minCh
+                               && chStart <= chEnd && chEnd <= maxCh;
                 if (!okRange) {
                     badPayload = true;
                     break;

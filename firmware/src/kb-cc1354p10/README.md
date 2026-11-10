@@ -587,17 +587,25 @@ range/sensitivity here may be materially worse than at 915 MHz even though
 the channel plan and RF core setup are both correct; that would show up as
 weak/noisy capture, not as a wrong frequency.
 
-## On-chip channel-hop jamming (`KBCapabilities.PHYJAM_HOP`, sub-1GHz only)
+## On-chip channel-hop jamming (`KBCapabilities.PHYJAM_HOP`, both bands)
 
 `CMD_JAM_HOP_ON` (`0x0C`) starts a constant-carrier jam that rotates across
-a host-supplied, **cross-page** sub-1GHz channel list (page 31 and/or page
-28) entirely inside the firmware - `jamHopThread()` in `main.c` loops
-calling the same `rfTuneToChannel()`/`rfJamStart()`/`rfJamStop()` primitives
-`SET_CHANNEL` already uses, with no host round trip per hop. Ported from
-the CC1352P7 firmware's same-named, 2.4GHz-only version (see that
-firmware's README for the ~30ms-per-host-round-trip measurement that
-motivates this) - **deliberately not offered on 2.4GHz/page 0 on this
-firmware**, sub-1GHz only.
+a host-supplied channel list entirely inside the firmware - `jamHopThread()`
+in `main.c` loops calling the same `rfTuneToChannel()`/`rfJamStart()`/
+`rfJamStop()` primitives `SET_CHANNEL` already uses, with no host round trip
+per hop.
+
+**Both bands, one command.** Each hop range carries its own page, and the
+firmware picks the RF band from it: page 0 = 2.4GHz (channels 11-26), pages
+28/31 = sub-1GHz. `startJamHop()` forces `BAND_24GHZ` or `BAND_SUBG` from the
+first range's page, and the handler requires every range in a list to be the
+**same band** (a cross-band hop would need a per-hop `RF_close()`/`RF_open()`
+band switch - the documented hang/brown-out risk - which this on-chip loop
+avoids). This is why `tools/jam24_hop.py` (2.4GHz) now runs on this board,
+not just the CC1352P7; the Python side exposes `jam_hop_on(channels)` for
+2.4GHz and `jam_hop_subg_on(hops)` for sub-1GHz, matching the CC1352P7
+driver. Originally sub-1GHz-only (ported from the CC1352P7's 2.4GHz version);
+2.4GHz was added by extending the existing range machinery to accept page 0.
 
 **Each hop entry is an inclusive `[page][chStart][chEnd]` range, not a
 bare channel** - `payload = [dwell_ms lo][dwell_ms hi][rangeCount]

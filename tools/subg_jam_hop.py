@@ -3,11 +3,13 @@
 subg_jam_hop.py - On-chip rotating constant-carrier jammer across a
 *cross-page* sub-1GHz channel list (page 31 = 915 MHz US ISM and/or page
 28 = 863-876 MHz EU/UK), using KillerBee's jam_hop_subg_on()
-(KBCapabilities.PHYJAM_HOP). Works against both the CC1354P10 (default,
-its own CMD_JAM_HOP_ON) and the CC1352P7 (-d cc1352p7, CMD_JAM_HOP_SUBG_ON
-- a separate command there since its own CMD_JAM_HOP_ON is a distinct,
-2.4GHz-only hop mode) - same channel plan on both, so the same command
-line works against either board.
+(KBCapabilities.PHYJAM_HOP). Works against both the CC1354P10 and the
+CC1352P7 - the board is auto-detected from the port, so no -d is needed
+(pass -d cc1354p10/cc1352p7 only to override). The two use different wire
+commands for this sub-1GHz hop (CC1354P10: CMD_JAM_HOP_ON; CC1352P7:
+CMD_JAM_HOP_SUBG_ON - a separate command there since its own CMD_JAM_HOP_ON
+is a distinct, 2.4GHz-only hop mode), but the channel plan is the same on
+both, so the same command line works against either board.
 
 Same jam (constant-carrier, modulated PRBS-15 garbage - KBCapabilities.
 PHYJAM) and same cross-page rotation idea as tools/subg_jam.py's
@@ -52,11 +54,11 @@ still showed real spikes, the same inconsistent-per-hop pattern as
 cost becomes the same order of magnitude as the requested dwell). Treat
 3ms as the shortest --dwell to rely on; below that is not recommended.
 
-Usage:
+Usage (board auto-detected from -i, so no -d needed on either board):
     python3 tools/subg_jam_hop.py -i /dev/cu.usbmodemLS4501DC1 --dwell 0.02 \\
         --page-channels 31:9,14,15,19,20,24,106 \\
         --page-channels 28:10,12,20,41,51,57
-python3 tools/subg_jam_hop.py -i /dev/cu.usbmodemL45003IW1 -d cc1352p7 --dwell 0.02 --page-channels 28:9-65
+    python3 tools/subg_jam_hop.py -i /dev/cu.usbmodemL45003IW1 --dwell 0.02 --page-channels 28:9-65
 
 Ctrl+C stops cleanly (JAMMER_OFF, then closes the device) at any point.
 """
@@ -75,15 +77,35 @@ from subg_jam import parse_page_channels  # reuse, don't duplicate
 from subg_scan import PAGE_INFO  # reuse, don't duplicate
 
 
+def resolve_devtype(iface, explicit):
+    """Pick the KillerBee hardware type for `iface`. Honor an explicit -d;
+    otherwise probe the port so the correct driver is used no matter which
+    board is on which port (the usual cause of a 'Device rejected' error is
+    the wrong -d/port). Both the CC1354P10 and CC1352P7 do sub-1GHz on-chip
+    hop, so either is fine here. Returns None if nothing recognizable answers."""
+    if explicit:
+        return explicit
+    try:
+        from killerbee import kbutils  # type: ignore
+        if kbutils.iscc1354p10(iface):
+            return "cc1354p10"
+        if kbutils.iscc1352p7(iface):
+            return "cc1352p7"
+    except Exception:
+        pass
+    return None
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-i", "--iface", default="/dev/ttyACM0",
                      help="Serial device (default: /dev/ttyACM0)")
-    ap.add_argument("-d", "--devtype", default="cc1354p10",
-                     help="KillerBee hardware type: cc1354p10 (default) or cc1352p7 "
-                          "- both implement on-chip sub-1GHz hop jamming, page 28 "
-                          "and page 31, at the same channel plan on each")
+    ap.add_argument("-d", "--devtype", default=None,
+                     help="KillerBee hardware type (default: auto-detect from the "
+                          "port). Both the CC1354P10 and CC1352P7 implement on-chip "
+                          "sub-1GHz hop jamming (page 28 and page 31, same channel "
+                          "plan on each), so either board works here.")
     ap.add_argument("--page-channels", action="append", required=True,
                      metavar="PAGE:CHANNELS",
                      help="'PAGE:CHANNELS' (e.g. '31:9,14,15,19,20,24,106'), "
@@ -111,16 +133,23 @@ def main() -> None:
         print("error: --dwell out of range (valid: 0.001-65.535 seconds)", file=sys.stderr)
         sys.exit(1)
 
-    kb = KillerBee(device=args.iface, hardware=args.devtype)
+    devtype = resolve_devtype(args.iface, args.devtype)
+    if devtype is None:
+        print("error: could not auto-detect a CC1352P7/CC1354P10 on %s - check the "
+              "port, or pass -d explicitly (cc1354p10 / cc1352p7)." % args.iface,
+              file=sys.stderr)
+        sys.exit(1)
+
+    kb = KillerBee(device=args.iface, hardware=devtype)
     for page in sorted(set(p for p, _ in hops)):
         page_info = PAGE_INFO[page]
         if not kb.check_capability(page_info["capability"]):
             print("error: %s does not report %s support (page %d)"
-                  % (args.devtype, page_info["band_name"], page), file=sys.stderr)
+                  % (devtype, page_info["band_name"], page), file=sys.stderr)
             sys.exit(1)
     if not kb.check_capability(KBCapabilities.PHYJAM_HOP):
         print("error: %s does not report PHYJAM_HOP (on-chip channel-hop jam) "
-              "support" % args.devtype, file=sys.stderr)
+              "support" % devtype, file=sys.stderr)
         sys.exit(1)
 
     print("On-chip hopping %d channel(s) across page(s) %s: %s"

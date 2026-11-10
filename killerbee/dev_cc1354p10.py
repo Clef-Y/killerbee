@@ -193,12 +193,12 @@ class CC1354P10:
         self.capabilities.setcapab(KBCapabilities.SELFACK, True)
         self.capabilities.setcapab(KBCapabilities.PHYJAM, True)
         self.capabilities.setcapab(KBCapabilities.PHYJAM_REFLEX, True)
-        # On-chip channel-hop jamming (CMD_JAM_HOP_ON) - sub-1GHz only on
-        # this firmware (pages 31/28; ported from the CC1352P7 firmware's
-        # 2.4GHz-only version) - see firmware/src/kb-cc1354p10/main.c's
-        # "stage 6" comment. jam_hop_on() enforces the sub-1GHz-only
-        # restriction; this flag just advertises on-chip hop support in
-        # general, same as how PHYJAM's specifics are validated per-device.
+        # On-chip channel-hop jamming (CMD_JAM_HOP_ON): both 2.4GHz (page 0,
+        # channels 11-26, via jam_hop_on()) and sub-1GHz cross-page (pages
+        # 31/28, via jam_hop_subg_on()). One wire command; the firmware picks
+        # the band from the page in each hop range - see main.c's
+        # KB_CMD_JAM_HOP_ON. (2.4GHz hop was added so tools/jam24_hop.py runs
+        # on this board too, not just the CC1352P7.)
         self.capabilities.setcapab(KBCapabilities.PHYJAM_HOP, True)
         # The native IEEE 802.15.4 RX/TX radio commands use a fixed,
         # standard-compliant O-QPSK preamble/SFD - there is no register to
@@ -473,28 +473,63 @@ class CC1354P10:
         ranges.append((curPage, start, end))
         return ranges
 
-    def jam_hop_on(self, hops: List[Tuple[int, int]], dwell_ms: int) -> None:
+    def jam_hop_on(self, channels: List[int], dwell_ms: int) -> None:
         '''
-        Starts a constant-carrier jam that hops across the given
-        *cross-page* sub-1GHz channel list entirely on-chip - no host
-        round-trip per hop, unlike driving the same rotation via repeated
-        set_channel() calls (what tools/subg_jam.py's --page-channels does).
-        See firmware/src/kb-cc1354p10/README.md's "On-chip channel-hop
-        jamming" section for why this exists and how it compares. Stop
-        with jammer_off() - the same command that stops every other jam
-        mode.
-        @param hops: List of (page, channel) tuples, in hop order. page
-            must be 31 (channel 0-128) or 28 (channel 0-65) - 2.4GHz
-            (page 0) is not supported by this on-chip hop command on this
-            firmware. Each entry carries its own page (not a bare
-            channel) since page 31 and page 28 use different frequency
-            formulas at the same raw channel number. Internally collapsed
-            into contiguous (page, start, end) ranges before sending -
-            see _collapse_to_ranges() - so there is no small, fixed cap on
-            len(hops) itself; a large contiguous request (e.g. 9-128)
-            costs the same 3 wire bytes as a single channel.
+        Starts a constant-carrier jam that hops across the given 2.4GHz
+        IEEE 802.15.4 channels (11-26) entirely on-chip - no host round-trip
+        per hop. Matches dev_cc1352p7.CC1352P7.jam_hop_on()'s signature, so
+        tools/jam24_hop.py now drives this board too (previously CC1352P7-
+        only). For sub-1GHz cross-page hop use jam_hop_subg_on(). Stop with
+        jammer_off() - the same command that stops every other jam mode.
+        @param channels: 2.4GHz channels (11-26) in hop order.
         @param dwell_ms: milliseconds to jam each channel before hopping to
             the next (1-65535).
+        '''
+        self.capabilities.require(KBCapabilities.PHYJAM_HOP)
+        if not channels:
+            raise Exception('channels must be a non-empty list of 2.4GHz channels (11-26)')
+        for ch in channels:
+            if ch < 11 or ch > 26:
+                raise Exception('2.4GHz channel %d out of range (valid: 11-26)' % ch)
+        if dwell_ms < 1 or dwell_ms > 0xFFFF:
+            raise Exception('dwell_ms must be 1-65535')
+
+        # The CC1354P10 firmware uses ONE on-chip hop command (CMD_JAM_HOP_ON)
+        # for both bands and picks 2.4GHz vs sub-1GHz from the page in each
+        # (page, chStart, chEnd) range. Encode the 2.4GHz channels as page-0
+        # ranges via the same collapse the sub-1GHz path uses, preserving the
+        # requested hop order.
+        hops = [(0, ch) for ch in channels]
+        ranges = self._collapse_to_ranges(hops)
+        if len(ranges) > MAX_HOP_RANGES:
+            raise Exception('channels collapse to %d contiguous ranges, more than the '
+                             'firmware supports (%d)' % (len(ranges), MAX_HOP_RANGES))
+
+        payload = struct.pack('<HB', dwell_ms, len(ranges))
+        for page, chStart, chEnd in ranges:
+            payload += bytes([page, chStart, chEnd])
+        status = self.__command(CMD_JAM_HOP_ON, payload)
+        if status[0] != STATUS_OK:
+            raise Exception("Device rejected jam_hop_on()")
+
+    def jam_hop_subg_on(self, hops: List[Tuple[int, int]], dwell_ms: int) -> None:
+        '''
+        Starts a constant-carrier jam that hops across the given *cross-page*
+        sub-1GHz channel list entirely on-chip - no host round-trip per hop,
+        unlike driving the same rotation via repeated set_channel() calls
+        (what tools/subg_jam.py's --page-channels does). See
+        firmware/src/kb-cc1354p10/README.md's "On-chip channel-hop jamming"
+        section. Stop with jammer_off().
+        @param hops: List of (page, channel) tuples, in hop order. page must
+            be 31 (channel 0-128) or 28 (channel 0-65). For 2.4GHz (page 0)
+            use jam_hop_on() instead. Each entry carries its own page (not a
+            bare channel) since page 31 and page 28 use different frequency
+            formulas at the same raw channel number. Internally collapsed
+            into contiguous (page, start, end) ranges before sending - see
+            _collapse_to_ranges() - so there is no small, fixed cap on
+            len(hops); a large contiguous request (e.g. 9-128) costs the same
+            3 wire bytes as a single channel.
+        @param dwell_ms: milliseconds to jam each channel (1-65535).
         '''
         self.capabilities.require(KBCapabilities.PHYJAM_HOP)
         if not hops:
@@ -503,8 +538,8 @@ class CC1354P10:
             okPair = (page == 31 and 0 <= ch <= 128) or (page == 28 and 0 <= ch <= 65)
             if not okPair:
                 raise Exception('Invalid (page=%d, channel=%d) - must be '
-                                 '(31, 0-128) or (28, 0-65); 2.4GHz (page 0) is '
-                                 'not supported by this on-chip hop command' % (page, ch))
+                                 '(31, 0-128) or (28, 0-65); for 2.4GHz (page 0) '
+                                 'use jam_hop_on()' % (page, ch))
         if dwell_ms < 1 or dwell_ms > 0xFFFF:
             raise Exception('dwell_ms must be 1-65535')
 
@@ -519,18 +554,7 @@ class CC1354P10:
             payload += bytes([page, chStart, chEnd])
         status = self.__command(CMD_JAM_HOP_ON, payload)
         if status[0] != STATUS_OK:
-            raise Exception("Device rejected jam_hop_on()")
-
-    def jam_hop_subg_on(self, hops: List[Tuple[int, int]], dwell_ms: int) -> None:
-        '''
-        Alias for jam_hop_on() - this driver's only on-chip hop mode is
-        already sub-1GHz/cross-page, so both names do exactly the same
-        thing here. Exists so generic tools (e.g. tools/subg_jam_hop.py)
-        can call jam_hop_subg_on() uniformly across this driver and
-        dev_cc1352p7.CC1352P7, which needs the distinct name since its own
-        jam_hop_on() is a different, 2.4GHz-only hop mode.
-        '''
-        return self.jam_hop_on(hops, dwell_ms)
+            raise Exception("Device rejected jam_hop_subg_on()")
 
     def set_sync(self, sync: int = 0xA70F) -> Any:
         self.capabilities.require(KBCapabilities.SET_SYNC)

@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """
 jam24_hop.py - On-chip rotating constant-carrier jammer across specific
-2.4GHz IEEE 802.15.4 channels (11-26), using KillerBee's CC1352P7 driver's
-KBCapabilities.PHYJAM_HOP (CMD_JAM_HOP_ON).
+2.4GHz IEEE 802.15.4 channels (11-26), using KBCapabilities.PHYJAM_HOP
+(CMD_JAM_HOP_ON).
+
+Works on both the CC1352P7 and the CC1354P10 - the board is auto-detected
+from the port, so no -d is needed (pass -d only to override). Both firmwares
+implement 2.4GHz on-chip hop: the CC1352P7 natively, and the CC1354P10 via
+its shared hop command (one command for 2.4GHz and sub-1GHz, with the band
+chosen from each hop entry's page). For sub-1GHz on-chip hop on either
+board, use tools/subg_jam_hop.py.
 
 Same jam (constant-carrier, modulated PRBS-15 garbage - KBCapabilities.
 PHYJAM) and same channel rotation idea as tools/jam24_rotate.py, but the
@@ -49,6 +56,7 @@ tools/kb_jtag_recover.sh. Treat 3ms as the shortest --dwell to rely on;
 2ms works with reduced margin; below that is not recommended.
 
 Usage:
+    python3 tools/jam24_hop.py -i /dev/cu.usbmodemL45003IW1 -c 11-26 --dwell 0.002
     python3 tools/jam24_hop.py -i /dev/cu.usbmodemL45003IW1 -c 11,12,13,14,15,20,22,26 --dwell 0.02
     python3 tools/jam24_hop.py -c 11,25 --dwell 0.1
     python3 tools/jam24_hop.py -c 11,15,20,25 --dwell 0.05 --duration 30
@@ -64,6 +72,26 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from killerbee import KillerBee, KBCapabilities  # type: ignore
+
+
+def resolve_devtype(iface, explicit):
+    """Pick the KillerBee hardware type for `iface`. Honor an explicit -d;
+    otherwise probe the port so the correct driver is used no matter which
+    board is on which port - the usual cause of a 'Device rejected' error is
+    the wrong -d (or wrong port) for the board actually plugged in. Returns
+    None if nothing recognizable answers on the port."""
+    if explicit:
+        return explicit
+    try:
+        from killerbee import kbutils  # type: ignore
+        # Same probe order kbutils.devlist() uses.
+        if kbutils.iscc1354p10(iface):
+            return "cc1354p10"
+        if kbutils.iscc1352p7(iface):
+            return "cc1352p7"
+    except Exception:
+        pass
+    return None
 
 
 def parse_channels(spec: str) -> list:
@@ -91,9 +119,11 @@ def main() -> None:
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-i", "--iface", default="/dev/ttyACM0",
                      help="Serial device (default: /dev/ttyACM0)")
-    ap.add_argument("-d", "--devtype", default="cc1352p7",
-                     help="KillerBee hardware type (default: cc1352p7 - the only "
-                          "one that currently implements on-chip hop jamming)")
+    ap.add_argument("-d", "--devtype", default=None,
+                     help="KillerBee hardware type (default: auto-detect from the "
+                          "port). 2.4GHz on-chip hop jam is CC1352P7-only; the "
+                          "CC1354P10's on-chip hop is sub-1GHz only (use "
+                          "subg_jam_hop.py there).")
     ap.add_argument("-c", "--channels", required=True,
                      help="Channel spec, e.g. '11,12,13,14,15,20,22,26' or '11-26'")
     ap.add_argument("--dwell", type=float, default=0.02,
@@ -123,14 +153,20 @@ def main() -> None:
         print("error: --dwell out of range (valid: 0.001-65.535 seconds)", file=sys.stderr)
         sys.exit(1)
 
-    kb = KillerBee(device=args.iface, hardware=args.devtype)
+    devtype = resolve_devtype(args.iface, args.devtype)
+    if devtype is None:
+        print("error: could not auto-detect a CC1352P7/CC1354P10 on %s - check the "
+              "port, or pass -d explicitly (cc1352p7 / cc1354p10)." % args.iface,
+              file=sys.stderr)
+        sys.exit(1)
+    kb = KillerBee(device=args.iface, hardware=devtype)
     if not kb.check_capability(KBCapabilities.FREQ_2400):
-        print("error: %s does not report 2.4GHz (FREQ_2400) support" % args.devtype,
+        print("error: %s does not report 2.4GHz (FREQ_2400) support" % devtype,
               file=sys.stderr)
         sys.exit(1)
     if not kb.check_capability(KBCapabilities.PHYJAM_HOP):
         print("error: %s does not report PHYJAM_HOP (on-chip channel-hop jam) "
-              "support" % args.devtype, file=sys.stderr)
+              "support" % devtype, file=sys.stderr)
         sys.exit(1)
 
     print("On-chip hopping %d channel(s): %s" % (len(channels), args.channels))
