@@ -70,6 +70,11 @@ const customStack = scripting.addModule("/ti/devices/radioconfig/custom");
 const phyInst = commonRf.addIeeePhy(customStack, default154Phy);
 phyInst.$name = "RF_Settings_IEEE_802_15_4";
 phyInst.codeExportConfig.useMulti = false;
+// TX power raised 0 -> +5 dBm for the authorized TX-power-promotion bench
+// test. +5 dBm is the ceiling of this board's 2.4 GHz default-PA table
+// (txPowerTable_2400_pa5) - the +20 dBm high-PA on LP_CC1352P7_1 is routed
+// to the sub-1GHz path, not 2.4 GHz, so +20 dBm is not reachable here.
+phyInst.txPower = "5";
 
 /* ======== Radio Configuration: 915 MHz Wi-SUN (sub-1GHz) PHY ========
  * NOT the same PHY as kb_cc1354p10.syscfg's sub-1GHz config, and this is
@@ -92,12 +97,28 @@ phyInst.codeExportConfig.useMulti = false;
  * O-QPSK traffic the CC1354P10 targets - a real capability difference to
  * document clearly, not paper over.
  *
- * txPower conservatively set to 0 dBm, same rationale as
- * kb_cc1354p10.syscfg: a hardware brown-out mitigation found on the
- * CC1354P10 from the PA's current step on TX key-up exceeding what that
- * board's power delivery could sustain - not yet independently
- * characterized on this board's own power delivery path, so kept equally
- * conservative here rather than assumed safe at a higher power.
+ * txPower raised 0 -> +20 dBm via the HIGH-PA path (highPA + txPowerHi) for
+ * the authorized TX-power-promotion bench test, pushed to the chip's max.
+ * HISTORY / RISK: this was conservatively 0 dBm as a hardware brown-out
+ * mitigation (VDDS_LOSS from the PA's current step on TX key-up exceeding
+ * what the board's USB/XDS110 power delivery could sustain - see main.c's
+ * rfJamStart/stopJammer comments and git 298e026/45715e7). +20 dBm is the
+ * WORST case for that inrush (~64 mA per the datasheet, vs ~25 mA at +14
+ * and far less at the +10 dBm default-PA level already shown to survive),
+ * so on paper this is the most likely setting to re-trigger the brown-out.
+ * EMPIRICAL RESULT (this board, bench, USB/XDS110 power): it did NOT brown
+ * out - 12/12 clean key-up cycles across page 31 and page 28, multiple
+ * channels, 1s sustained carrier each, 0 resets, UART responsive throughout.
+ * The original brown-out was the DEFAULT-PA current ramp at the old ~14 dBm
+ * default; the HIGH-PA path has its own supply/LDO behaviour (note the
+ * ldoTrim field in the +20 dBm HIGH_PA_ENTRY) and ramps differently, so it
+ * clears the rail dip that sank the default-PA path. A second CC1354P10
+ * measured the carrier rising to ~-46 dBm (page 31) / -41 dBm (page 28),
+ * ~+21-24 dB over the 0 dBm baseline - i.e. the promotion tracks the
+ * commanded power essentially 1:1 all the way to +20 dBm. CAVEAT: validated
+ * for short jam bursts only; sustained-TX thermal/supply behaviour at
+ * +20 dBm over minutes is not characterized here. Still a characterization
+ * point, not a low-power default - but it is NOT the hazard it was feared.
  *
  * Runtime-switched with the 2.4 GHz PHY above via RF_close()+RF_open() in
  * main.c - see its rfSwitchBand() comment. */
@@ -105,7 +126,13 @@ const subgPhy = {
     args: {
         freqBand: "868",
         phyType868: "2gfsk50kbps25dev915wsun1b",
-        txPower: "0",
+        // HIGH-PA +20 dBm. highPA must be applied before txPowerHi:
+        // commonRf.addPropPhy() sets args onto the instance in object order,
+        // and toggling highPA resets txPowerHi to a default that the
+        // explicit "20" below must then override.
+        txPower: "10",        // std-PA value, unused while highPA = true
+        highPA: true,
+        txPowerHi: "20",
         // Without an explicit override, SysConfig's computed default for
         // this preset (derived from other packet-length-mode settings, not
         // a plain literal) came out invalid ("Max Packet Length must be

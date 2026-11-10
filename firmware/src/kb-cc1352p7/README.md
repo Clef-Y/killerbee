@@ -340,3 +340,50 @@ Not yet validated end-to-end through the `killerbee` Python package's
 second sub-1GHz Wi-SUN-speaking device was available) — only raw
 wire-level protocol testing plus the driver-level smoke test in
 `killerbee/dev_cc1352p7.py`'s existing test coverage.
+
+## TX power: raised to the board maximum, with a measured promotion sweep
+
+The PHY `txPower` settings in `kb_cc1352p7.syscfg` were raised from the
+historical conservative **0 dBm** (a brown-out mitigation, see below) to
+each band's **hardware maximum on this LP_CC1352P7_1**:
+
+| Band | PHY / PA path | `txPower` | Notes |
+|---|---|---|---|
+| 2.4 GHz (page 0) | IEEE 802.15.4, default PA | **+5 dBm** | Table ceiling (`txPowerTable_2400_pa5`). The +20 dBm high-PA is routed in copper to sub-1GHz on this board variant, so 2.4 GHz cannot exceed the default PA — SysConfig rejects `txPower > 5` for 2400 MHz here (`rfdesign.syscfg.js` requires `pa20 == "fb24g"`, which the _1 is not). +20 dBm @ 2.4 GHz needs the LP_CC1352P7_4 variant. |
+| sub-1 G 915 (page 31) | 2-GFSK Wi-SUN 1b, **high PA** | **+20 dBm** | `highPA + txPowerHi` → `RF_TxPowerTable_HIGH_PA_ENTRY`, `.txPower = 0xFFFF` + `pRegOverrideTx20`. |
+| sub-1 G 868 (page 28) | same PHY, retuned | **+20 dBm** | same high-PA path. |
+
+### Verification: two-board RSSI sweep (CC1352P7 jam → CC1354P10 listen)
+
+A second board (CC1354P10) measured the constant-carrier jam RSSI on a
+quiet channel per band, at each firmware power level. Received power tracks
+commanded TX power ~1:1, confirming the promotion is real:
+
+| Band (ch) | 0 dBm | +10 dBm (def PA) | +20 dBm (high PA) |
+|---|---|---|---|
+| page 31, ch 5 (903.2 MHz) | −70 dBm | −59 dBm (+11) | **−46 dBm (+24)** |
+| page 28, ch 5 (864.0 MHz) | −62 dBm | −51 dBm (+11) | **−41 dBm (+21)** |
+| 2.4 GHz, ch 15 (2425 MHz) | −98 dBm¹ | — | +5 dBm: **−73 dBm** |
+
+¹ The 0 dBm 2.4 GHz baseline was marginal (near the −110 dBm floor, weak
+cross-board coupling); its absolute value is unreliable, the +5 dBm −73 dBm
+is stable across repeats.
+
+### The brown-out that wasn't (high PA ≠ the default-PA hazard)
+
+The historical 0 dBm setting was a mitigation for a **VDDS_LOSS brown-out**
+from the **default-PA** current ramp on TX key-up at the old ~14 dBm SDK
+default (see `rfJamStart`/`stopJammer` in `main.c`, git `298e026`/`45715e7`).
+The **high-PA** path at +20 dBm was expected to be the worst case for that
+inrush (~64 mA), but empirically it **did not brown out**: **12/12 clean
+key-up cycles** across page 31 and page 28, multiple channels, 1 s sustained
+carrier each, 0 resets, UART responsive throughout — and a post-burst `PING`
+health check passed every time. The high-PA path has its own supply/LDO
+behaviour (note the `ldoTrim` field in the +20 dBm `HIGH_PA_ENTRY`) and rides
+over the rail dip that sank the default PA. The default-PA +10 dBm level was
+also clean.
+
+**Caveat:** validated for **short jam bursts** (≤ ~1 s key-ups) only.
+Sustained +20 dBm TX over minutes (thermal / PA-supply droop) is not
+characterized. Treat +20 dBm as a validated characterization point, not a
+low-power default — and only transmit where you are legally authorized to.
