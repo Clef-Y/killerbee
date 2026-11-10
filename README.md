@@ -238,9 +238,18 @@ The current version, fixes, etc are handled by: killerbee@riverloopsecurity.com.
 
 For contributors/developers, see [`DEVELOPMENT.md`](DEVELOPMENT.md) for details and guidance.
 
-This fork adds custom TI CC1354P10 / CC1352P7 firmware. To just *use* an
-already-flashed board, see [`USAGE_GUIDE.md`](USAGE_GUIDE.md) (host setup +
-every CLI tool) and [`MACOS_SETUP.md`](MACOS_SETUP.md) (macOS host setup).
-To *build or flash* the firmware, see the TI SDK / dev-environment guides:
-[`TI_SDK_SETUP_DEBIAN.md`](TI_SDK_SETUP_DEBIAN.md) and
-[`TI_SDK_SETUP_MACOS.md`](TI_SDK_SETUP_MACOS.md).
+This fork adds custom TI CC1354P10 / CC1352P7 firmware.
+
+- **New to this fork / setting up a board from scratch?** Start with
+  [`BUILD_YOUR_OWN_BOARD.md`](BUILD_YOUR_OWN_BOARD.md) - a single recipe
+  from a bare TI LaunchPad to a working KillerBee board, tying the guides
+  below together. `scripts/make_release.sh` packages a shareable bundle of
+  the prebuilt firmware + host tools + docs for handing to others.
+- **Just *using* an already-flashed board?** See
+  [`USAGE_GUIDE.md`](USAGE_GUIDE.md) (host setup + every CLI tool) and
+  [`MACOS_SETUP.md`](MACOS_SETUP.md) (macOS host setup). On macOS there is
+  also a small receive-only GUI for device discovery + RSSI scan -
+  [`macapp/`](macapp/README.md) (`python3 macapp/kb_toolkit.py`).
+- **Building or flashing the firmware?** See the TI SDK / dev-environment
+  guides: [`TI_SDK_SETUP_DEBIAN.md`](TI_SDK_SETUP_DEBIAN.md) and
+  [`TI_SDK_SETUP_MACOS.md`](TI_SDK_SETUP_MACOS.md).
